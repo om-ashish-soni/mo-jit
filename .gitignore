@@ -1,0 +1,36 @@
+# Go
+*.exe
+*.test
+*.out
+/vendor/
+/bin/
+/dist/
+coverage.out
+
+# C / NDK
+*.o
+*.a
+/build/
+/obj/
+/android-build/
+
+# Runtime-built shared libs. The checked-in ones (once M1 ships)
+# will live at explicit paths and be force-added.
+*.so
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Stalker fork build artifacts
+gum/build/
+gum/frida-gum/build/
+
+# Example-demo artifacts
+examples/**/rootfs/
+examples/**/overlay-upper/
+examples/**/*.sqsh
+examples/**/*.tar.zst
