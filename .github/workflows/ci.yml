@@ -46,3 +46,15 @@ jobs:
       - name: gofmt diff
         run: |
           diff -u <(echo -n) <(gofmt -d .)
+
+  hook-abi:
+    name: gum svc-hook ABI C test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run mojit_hook_test
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -pthread \
+             gum/mojit_hook.c gum/mojit_hook_test.c \
+             -o /tmp/mojit_hook_test
+          /tmp/mojit_hook_test
