@@ -1,0 +1,3 @@
+[submodule "gum/frida-gum"]
+	path = gum/frida-gum
+	url = https://github.com/om-ashish-soni/frida-gum.git
