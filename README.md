@@ -15,6 +15,42 @@ No kernel namespaces, no `/dev/kvm`, no `MANAGE_VIRTUAL_MACHINE`. Works on any A
 
 **Pre-alpha — scaffolded 2026-04-18.** M1 (Stalker fork + Android build) kicks off next. See [PLAN.md](PLAN.md) for the roadmap.
 
+## First product: mo-jit Terminal
+
+The runtime ships first as a standalone Android terminal app — **mo-jit Terminal** — not as a library for a larger product. Think "Termux but actually isolated, actually native speed, actually a real container."
+
+- Installs as a normal APK. No root, no Shizuku, no pairing.
+- First run: downloads the Debian-slim rootfs (~220 MB), resumable.
+- You get a `bash` prompt inside a fully isolated Debian userland with internet, `apt`, and the full dev toolchain on demand.
+- Fully open source, Apache-2.0 (plus LGPL-2.1 for the `gum/` subtree).
+- No telemetry, no account, no cloud anything.
+
+mo-jit Terminal lives in [`android-app/`](android-app/). It lands after M5 (see [PLAN.md](PLAN.md)).
+
+## Products built on mo-jit
+
+| Product | Role | Repo |
+|---|---|---|
+| mo-jit Terminal | First-party reference consumer — the product that proves the runtime | [`android-app/`](android-app/) in this repo |
+| [mo-code](https://github.com/om-ashish-soni/mo-code) | On-device AI coding agent; embeds mo-jit as a Go module | separate repo |
+| *your app here* | Any Android app that wants real isolation + native speed | — |
+
+## How we relate to Termux
+
+[Termux](https://termux.dev) is the reference point — the only project that has actually shipped a usable Linux userland on stock Android at scale. We study their decade of Android userspace engineering and we stand on their shoulders: W^X handling, APK-asset boot sequences, PTY emulation, keyboard-extras bars, the `proot-distro` bootstrap flow.
+
+We are not a fork. We do not import their GPL-3.0 code. We build a different thing:
+
+| | Termux | mo-jit Terminal |
+|---|---|---|
+| Isolation | None — same UID, same SELinux label as the host app | Real — syscall gate + FS/net/PID virtualization |
+| Guest speed on Debian | ~10–25× via `proot-distro` (ptrace overhead) | ~2× via JIT block cache |
+| Libc | bionic-first (their own package repo) | glibc-first (real Debian via overlay) |
+| Package manager | Their own `pkg` + Termux apt repos | Upstream Debian apt, unchanged |
+| Target audience | Power users comfortable with bionic + Termux packages | Developers who want a real Linux container on their phone |
+
+See [TERMUX_REFERENCE.md](TERMUX_REFERENCE.md) for the specific Termux subsystems we study and what we learn from each.
+
 ## How it works
 
 mo-jit is three things stacked:

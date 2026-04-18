@@ -43,7 +43,20 @@ If the guest and host share the same ISA, you don't need an emulator — you nee
 - Publish `v0.1.0` GitHub Release with prebuilt `libmojit-gum.so` and `mojit-shell` for `arm64-v8a` Android.
 - Announce on HN / r/androiddev / r/programming.
 
-### M6 — mo-code adapter (week 11)
+### M6 — mo-jit Terminal (Android app) — the first product (weeks 11–14)
+
+**This is the product that ships mo-jit to the world.** Not mo-code. See [android-app/README.md](android-app/README.md) for the full product scope.
+
+- Android app wrapper: Jetpack Compose (leaning) or Flutter — decision due start of M6.
+- PTY host: opens `/dev/ptmx`, wires to a terminal emulator (plan: wrap `libvterm` (MIT) or ship a clean-room Rust VT-220 impl; **not** Termux's GPL emulator).
+- Foreground service + persistent notification to survive Doze.
+- Keyboard extras bar at parity-or-better with Termux.
+- First-run download UX: 220 MB Debian slim rootfs, resumable, SHA256-verified, extracted to `filesDir/rootfs-debian/lower/`.
+- Session registry: multiple concurrent shells, persistent across screen-off.
+- Release channels: GitHub Releases first (universal APK + arm64-split APK), then F-Droid, then Play Store (if reviewer doesn't object to JIT + memfd).
+- Exit criterion: on a mid-range 2024 Android arm64 device, fresh install → `bash` prompt in ≤90 s on WiFi; `apt install htop && htop` works; `go build` of `cli/cli` completes in ≤240 s.
+
+### M7 — mo-code adapter (week 15)
 
 - mo-code's `backend/sandbox/mojit/backend.go` depends on `github.com/om-ashish-soni/mo-jit/gate` via Go modules.
 - Feature-flag rollout inside mo-code with the old proot path as fallback.
