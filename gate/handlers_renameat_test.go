@@ -266,14 +266,100 @@ func TestRenameAtSameLayerUpperDir(t *testing.T) {
 	}
 }
 
-func TestRenameAtCrossLayerDirReturnsEXDEV(t *testing.T) {
-	// Lower has a dir; userspace is expected to fall back to
-	// copy-tree + unlinkat when we surface EXDEV — same idiom the
-	// kernel uses when rename crosses mounts.
+// TestRenameAtCrossLayerEmptyDirPromotes is the simplest shape of
+// cross-layer dir rename: a lower-only empty dir moved to a new name.
+// Must succeed (kernel overlayfs would), produce the dst on upper,
+// and leave a whiteout at the old path so the guest doesn't see it.
+func TestRenameAtCrossLayerEmptyDirPromotes(t *testing.T) {
 	h := newRenameHarness(t, true)
 	mustMkdirAll(t, filepath.Join(h.lower, "d"))
 	r := h.rename(0xb0c0, "/d", 0xb0c1, "/d2")
-	expectErrno(t, r, syscall.EXDEV)
+	if int64(r.X[0]) != 0 {
+		t.Fatalf("rename /d → /d2: X[0]=%d (%s)", int64(r.X[0]), syscall.Errno(-int64(r.X[0])))
+	}
+	if info, err := os.Stat(filepath.Join(h.upper, "d2")); err != nil || !info.IsDir() {
+		t.Errorf("upper /d2 not a dir: err=%v info=%v", err, info)
+	}
+	if !pathIsWhiteout(t, filepath.Join(h.upper, "d")) {
+		t.Errorf("upper /d not a whiteout after rename")
+	}
+}
+
+// TestRenameAtCrossLayerDirWithChildrenPreservesTree mirrors apt's
+// post-install pattern: move a populated config dir from the base
+// image to a backup name. Every child — nested subdirs, regular
+// files, symlinks — must land on upper at the new location, with
+// perms and link targets intact.
+func TestRenameAtCrossLayerDirWithChildrenPreservesTree(t *testing.T) {
+	h := newRenameHarness(t, true)
+	root := filepath.Join(h.lower, "src")
+	mustMkdirAll(t, filepath.Join(root, "nested"))
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "nested/b.txt"), []byte("beta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a.txt", filepath.Join(root, "link-to-a")); err != nil {
+		t.Fatal(err)
+	}
+
+	r := h.rename(0xb0d0, "/src", 0xb0d1, "/dst")
+	if int64(r.X[0]) != 0 {
+		t.Fatalf("rename /src → /dst: X[0]=%d (%s)", int64(r.X[0]), syscall.Errno(-int64(r.X[0])))
+	}
+
+	dst := filepath.Join(h.upper, "dst")
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "alpha" {
+		t.Errorf("dst/a.txt contents = %q err=%v, want \"alpha\"", data, err)
+	}
+	if info, err := os.Stat(filepath.Join(dst, "a.txt")); err == nil && info.Mode().Perm() != 0o640 {
+		t.Errorf("dst/a.txt mode = %o, want 0o640", info.Mode().Perm())
+	}
+	if b, err := os.ReadFile(filepath.Join(dst, "nested/b.txt")); err != nil || string(b) != "beta" {
+		t.Errorf("dst/nested/b.txt contents = %q err=%v, want \"beta\"", b, err)
+	}
+	target, err := os.Readlink(filepath.Join(dst, "link-to-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "a.txt" {
+		t.Errorf("dst/link-to-a → %q, want \"a.txt\"", target)
+	}
+	if !isOpaqueDir(dst) {
+		t.Errorf("cross-layer dir rename dst is not marked opaque")
+	}
+	if !pathIsWhiteout(t, filepath.Join(h.upper, "src")) {
+		t.Errorf("upper /src not whiteouted after rename")
+	}
+}
+
+// If lower shadows dst at the same path, the opaque marker must
+// prevent the merged readdir from leaking lower entries back into
+// the renamed-into directory.
+func TestRenameAtCrossLayerDirOpaqueHidesLowerShadow(t *testing.T) {
+	h := newRenameHarness(t, true)
+	mustMkdirAll(t, filepath.Join(h.lower, "src"))
+	if err := os.WriteFile(filepath.Join(h.lower, "src/a.txt"), []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustMkdirAll(t, filepath.Join(h.lower, "dst"))
+	if err := os.WriteFile(filepath.Join(h.lower, "dst/shadow.txt"), []byte("do-not-see-me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := h.rename(0xb0e0, "/src", 0xb0e1, "/dst")
+	if int64(r.X[0]) != 0 {
+		t.Fatalf("rename /src → /dst: X[0]=%d (%s)", int64(r.X[0]), syscall.Errno(-int64(r.X[0])))
+	}
+	dst := filepath.Join(h.upper, "dst")
+	if _, err := os.Stat(filepath.Join(dst, "a.txt")); err != nil {
+		t.Errorf("dst/a.txt missing after rename: %v", err)
+	}
+	if !isOpaqueDir(dst) {
+		t.Errorf("dst must be opaque to hide lower /dst/shadow.txt")
+	}
 }
 
 func TestRenameAtSymlinkCrossLayerPreservesTarget(t *testing.T) {

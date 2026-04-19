@@ -350,6 +350,71 @@ func copyAllXattrs(src, dst string) error {
 	return nil
 }
 
+// recursiveCopyUp mirrors the subtree rooted at srcRoot onto dstRoot,
+// preserving directory perms, symlinks, regular-file contents, and
+// user-visible xattrs. Used exclusively by cross-layer directory
+// rename: when the guest renames a lower-only directory to a new
+// location, we must first materialise the whole subtree onto upper so
+// os.Rename can then atomically move it into place on a single
+// filesystem.
+//
+// Scope restrictions:
+//   - dstRoot must not yet exist. Callers check this (rename only
+//     enters this path when oldUpper is absent, which by construction
+//     means dstRoot == oldUpper has never been populated).
+//   - Entries that are neither dirs nor symlinks nor regular files
+//     (sockets, device nodes, fifos) are skipped. apt/dpkg don't
+//     rename directories containing those; we surface a best-effort
+//     copy and keep going rather than fail the whole rename.
+//   - Doesn't honour lower→upper shadowing within the subtree because
+//     the caller has already established oldUpper doesn't exist —
+//     there's nothing on upper to shadow lower inside this subtree.
+func recursiveCopyUp(srcRoot, dstRoot string) error {
+	return filepath.Walk(srcRoot, func(srcPath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(srcRoot, srcPath)
+		if err != nil {
+			return err
+		}
+		dstPath := dstRoot
+		if rel != "." {
+			dstPath = filepath.Join(dstRoot, rel)
+		}
+		mode := info.Mode()
+		switch {
+		case mode.IsDir():
+			if err := os.MkdirAll(dstPath, mode.Perm()); err != nil {
+				return err
+			}
+			// MkdirAll honours the process umask, so re-chmod to lock
+			// in the exact lower perms. Ignored xattr copy failure is
+			// fine (same policy as copy-up of a regular file).
+			if err := os.Chmod(dstPath, mode.Perm()); err != nil {
+				return err
+			}
+			_ = copyAllXattrs(srcPath, dstPath)
+		case mode&os.ModeSymlink != 0:
+			target, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				return err
+			}
+		case mode.IsRegular():
+			if err := copyRegularFile(srcPath, dstPath, mode.Perm()); err != nil {
+				return err
+			}
+			_ = copyAllXattrs(srcPath, dstPath)
+		default:
+			// Best-effort skip for unsupported types; Walk continues.
+		}
+		return nil
+	})
+}
+
 // copyRegularFile streams src to dst with O_EXCL to refuse clobbering
 // an existing upper file. The caller's copyUpMu serialises callers,
 // but O_EXCL guards against a racing host-side create we did not

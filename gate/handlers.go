@@ -673,11 +673,21 @@ func handleRenameAt(d *Dispatcher, regs *Regs) Verdict {
 		srcInfo = oldLowerInfo
 	}
 
-	// Cross-layer dir rename would need a recursive copy-up; EXDEV
-	// tells userspace "fall back to copy + unlink".
+	// Cross-layer dir rename: src is a lower-only directory. Materialise
+	// the whole subtree onto upper first, then fall through to the
+	// same-layer os.Rename path below. After the rename lands, stamp
+	// opaque on dst so any lower-side shadow at the dst path is hidden
+	// from the guest's merged readdir.
 	if srcInfo.IsDir() && !oldOnUpper {
-		regs.X[0] = EncodeErrno(syscall.EXDEV)
-		return VerdictHandled
+		if err := os.MkdirAll(filepath.Dir(oldUpper), 0o755); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		if err := recursiveCopyUp(oldLower, oldUpper); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		oldOnUpper = true
 	}
 
 	if err := os.MkdirAll(filepath.Dir(newUpper), 0o755); err != nil {
@@ -759,6 +769,15 @@ func handleRenameAt(d *Dispatcher, regs *Regs) Verdict {
 			regs.X[0] = EncodeErrno(err)
 			return VerdictHandled
 		}
+	}
+
+	// For directory renames, stamp opaque on dst so any shadowing lower
+	// entries at newAbs stay invisible in the guest's merged readdir.
+	// POSIX says the dst is replaced entirely by src; without opaque,
+	// buildDirSnapshot would merge upper (rename result) with whatever
+	// lower happened to have at newAbs, bleeding stale entries through.
+	if srcInfo.IsDir() {
+		_ = syscall.Setxattr(newUpper, opaqueXattr, []byte{'y'}, 0)
 	}
 
 	regs.X[0] = 0
