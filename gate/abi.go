@@ -83,6 +83,10 @@ const (
 	// File / path syscalls (arm64 generic table — the classic
 	// open/stat/access/readlink/mkdir/unlink/rename numbers do NOT
 	// exist on arm64; only the *at variants do).
+	SysSetXattr   uint64 = 5
+	SysGetXattr   uint64 = 8
+	SysFSetXattr  uint64 = 7
+	SysFGetXattr  uint64 = 10
 	SysGetCwd     uint64 = 17
 	SysDup        uint64 = 23
 	SysDup3       uint64 = 24

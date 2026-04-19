@@ -163,6 +163,10 @@ func (d *Dispatcher) Dispatch(regs *Regs) Verdict {
 // getrandom, ...) and the safe default during bring-up.
 func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysChDir] = handleChDir
+	d.handlers[SysGetXattr] = handleGetXattr
+	d.handlers[SysSetXattr] = handleSetXattr
+	d.handlers[SysFGetXattr] = handleFGetXattr
+	d.handlers[SysFSetXattr] = handleFSetXattr
 	d.handlers[SysFAccessAt] = handleFAccessAt
 	d.handlers[SysFAccessAt2] = handleFAccessAt
 	d.handlers[SysGetCwd] = handleGetCwd

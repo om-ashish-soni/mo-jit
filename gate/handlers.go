@@ -1976,6 +1976,257 @@ func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// xattrNameMax mirrors include/uapi/linux/limits.h XATTR_NAME_MAX.
+// Using this instead of MaxPathLen keeps us honest about the kernel's
+// actual ceiling (255 bytes + NUL) and caps how much we'll copy out
+// of guest memory for a single call.
+const xattrNameMax = 256
+
+// handleGetXattr services getxattr(path, name, value, size) (NR=8).
+// Pure read — no copy-up. Returns the number of bytes the attribute
+// value occupies (or that was written into the guest buffer). size==0
+// is the "how big is it?" probe; we honour it by handing the kernel a
+// zero-length buffer.
+//
+// aarch64 layout: x0=path, x1=name, x2=value, x3=size.
+func handleGetXattr(d *Dispatcher, regs *Regs) Verdict {
+	path, err := d.Paths.ReadPath(regs.X[0], MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	size := int(regs.X[3])
+	absGuest, ok := absolutiseAt(d, int64(atFDCWD), path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	hostPath, _, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if size == 0 {
+		n, err := syscall.Getxattr(hostPath, name, nil)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		regs.X[0] = uint64(n)
+		return VerdictHandled
+	}
+	buf := make([]byte, size)
+	n, err := syscall.Getxattr(hostPath, name, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(regs.X[2], buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleSetXattr services setxattr(path, name, value, size, flags) (NR=5).
+// Write path → copy-up if the target lives on lower so we don't stamp
+// the read-only layer. flags carries XATTR_CREATE / XATTR_REPLACE; we
+// just forward them to the kernel.
+//
+// aarch64 layout: x0=path, x1=name, x2=value, x3=size, x4=flags.
+func handleSetXattr(d *Dispatcher, regs *Regs) Verdict {
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+	path, err := d.Paths.ReadPath(regs.X[0], MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	size := int(regs.X[3])
+	flags := int(regs.X[4])
+	var value []byte
+	if size > 0 {
+		value, err = d.MemR.ReadBytes(regs.X[2], size)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	absGuest, ok := absolutiseAt(d, int64(atFDCWD), path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+	if err := syscall.Setxattr(hostPath, name, value, flags); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFGetXattr services fgetxattr(fd, name, value, size) (NR=10).
+// Pure host-fd passthrough — reads don't need copy-up, and the guest
+// fd is already bound to the right layer from open time.
+func handleFGetXattr(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	size := int(regs.X[3])
+	if size == 0 {
+		n, err := fgetxattr(hostFd, name, nil)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		regs.X[0] = uint64(n)
+		return VerdictHandled
+	}
+	buf := make([]byte, size)
+	n, err := fgetxattr(hostFd, name, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(regs.X[2], buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleFSetXattr services fsetxattr(fd, name, value, size, flags) (NR=7).
+// Host-fd passthrough — we can't copy-up a live fd, so if the guest
+// holds a lower-layer fd the kernel will decide (typically success
+// since our "lower" is just a regular dir; a real read-only backing
+// store would surface EROFS).
+//
+// TODO: track per-fd layer at open time and refuse fsetxattr on an fd
+// that was opened O_RDONLY from lower, to keep the "lower is immutable"
+// invariant the rest of the handlers maintain.
+func handleFSetXattr(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	size := int(regs.X[3])
+	flags := int(regs.X[4])
+	var value []byte
+	if size > 0 {
+		value, err = d.MemR.ReadBytes(regs.X[2], size)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	if err := fsetxattr(hostFd, name, value, flags); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// fgetxattr / fsetxattr wrap the Linux syscalls that Go's syscall
+// package doesn't expose on linux/arm64 (only the path-based versions
+// are typed). Raw Syscall6 plus BytePtrFromString.
+func fgetxattr(fd int, name string, buf []byte) (int, error) {
+	nameBytes, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return 0, err
+	}
+	var bufPtr unsafe.Pointer
+	if len(buf) > 0 {
+		bufPtr = unsafe.Pointer(&buf[0])
+	}
+	r, _, errno := syscall.Syscall6(
+		syscall.SYS_FGETXATTR,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(nameBytes)),
+		uintptr(bufPtr),
+		uintptr(len(buf)),
+		0, 0,
+	)
+	if errno != 0 {
+		return int(r), errno
+	}
+	return int(r), nil
+}
+
+func fsetxattr(fd int, name string, value []byte, flags int) error {
+	nameBytes, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	var valPtr unsafe.Pointer
+	if len(value) > 0 {
+		valPtr = unsafe.Pointer(&value[0])
+	}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_FSETXATTR,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(nameBytes)),
+		uintptr(valPtr),
+		uintptr(len(value)),
+		uintptr(flags),
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
