@@ -35,6 +35,13 @@ type Dispatcher struct {
 	// NewDispatcher installs NoopMemWriter — see mem_writer.go.
 	Mem MemWriter
 
+	// FDs is the guest's file-descriptor table. Preseeded with stdio
+	// (0,1,2 -> host 0,1,2) so early prints survive. Handlers that
+	// allocate fds (openat, socket, accept) register the host fd with
+	// FDs.Allocate; handlers that release fds (close) go through
+	// FDs.Close.
+	FDs *FDTable
+
 	// handlers maps aarch64 syscall number -> Handler. An absent
 	// entry means "we don't intercept this syscall" and the svc hook
 	// passes it through to the kernel.
@@ -49,6 +56,7 @@ func NewDispatcher(p Policy) *Dispatcher {
 		Net:      NewNetGate(p.Net),
 		Paths:    NoopPathReader{},
 		Mem:      NoopMemWriter{},
+		FDs:      NewFDTable(),
 		handlers: make(map[uint64]Handler),
 	}
 	d.registerDefaults()
