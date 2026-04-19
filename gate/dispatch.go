@@ -128,4 +128,6 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysClose] = handleClose
 	d.handlers[SysRead] = handleRead
 	d.handlers[SysWrite] = handleWrite
+	d.handlers[SysNewFStatAt] = handleNewFStatAt
+	d.handlers[SysFStat] = handleFStat
 }

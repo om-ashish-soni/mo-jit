@@ -399,6 +399,129 @@ func handleWrite(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleNewFStatAt services newfstatat(dirfd, pathname, statbuf, flags)
+// (NR=79). Modern glibc/musl route both the `stat` and `lstat` libc
+// entry points through this syscall; libc's `fstat` also funnels here
+// via AT_EMPTY_PATH on kernels new enough to advertise it.
+//
+// aarch64 register layout:
+//
+//	x0 = dirfd, x1 = pathname, x2 = statbuf, x3 = flags
+//
+// Relevant flags:
+//   - AT_SYMLINK_NOFOLLOW: stat the link itself, not the target.
+//   - AT_EMPTY_PATH: if pathname == "", stat the file referred to by
+//     dirfd. We translate dirfd through FDTable so guest fds stay in
+//     guest space.
+//   - AT_NO_AUTOMOUNT: mo-jit doesn't automount; silently ignored.
+//
+// The stat buffer is always written in the aarch64 kernel wire format
+// (packStatAarch64), even when the host is x86_64 — the guest is
+// always arm64 regardless of test host.
+func handleNewFStatAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	bufPtr := regs.X[2]
+	flags := int(regs.X[3])
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	if path == "" && flags&atEmptyPath == 0 {
+		// Linux kernel: empty path without AT_EMPTY_PATH is ENOENT.
+		regs.X[0] = EncodeErrno(syscall.ENOENT)
+		return VerdictHandled
+	}
+
+	var st syscall.Stat_t
+	switch {
+	case path == "" && flags&atEmptyPath != 0:
+		// Stat the fd itself. Translate the guest fd, never hand it
+		// to the kernel directly.
+		hostFd, ok := d.FDs.Resolve(int(dirfd))
+		if !ok {
+			regs.X[0] = EncodeErrno(syscall.EBADF)
+			return VerdictHandled
+		}
+		if err := syscall.Fstat(hostFd, &st); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	default:
+		var absGuest string
+		switch {
+		case filepath.IsAbs(path):
+			absGuest = filepath.Clean(path)
+		case dirfd == int64(atFDCWD):
+			absGuest = d.FS.AbsFromGuest(path)
+		default:
+			regs.X[0] = EncodeErrno(syscall.ENOSYS)
+			return VerdictHandled
+		}
+		hostPath, _, err := d.FS.Resolve(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		// We've already resolved absGuest to a concrete host path, so
+		// stat/lstat on the host kernel side is sufficient; AT_EMPTY_PATH
+		// is handled by the other case, AT_NO_AUTOMOUNT is a no-op for
+		// us, leaving only AT_SYMLINK_NOFOLLOW.
+		var statErr error
+		if flags&atSymlinkNoFollow != 0 {
+			statErr = syscall.Lstat(hostPath, &st)
+		} else {
+			statErr = syscall.Stat(hostPath, &st)
+		}
+		if statErr != nil {
+			regs.X[0] = EncodeErrno(statErr)
+			return VerdictHandled
+		}
+	}
+
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	if err := d.Mem.WriteBytes(bufPtr, packStatAarch64(&st)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFStat services fstat(fd, statbuf) (NR=80). Still present in
+// the aarch64 table for old libc's that predate AT_EMPTY_PATH.
+func handleFStat(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(hostFd, &st); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	if err := d.Mem.WriteBytes(bufPtr, packStatAarch64(&st)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
