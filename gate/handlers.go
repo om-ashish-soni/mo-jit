@@ -1138,6 +1138,95 @@ func handleFStat(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleDup services dup(oldfd) (NR=23).
+//
+// aarch64 layout: x0 = oldfd.
+//
+// Returns the lowest-free GUEST fd, backed by a fresh HOST fd obtained
+// via syscall.Dup. The two host fds share the underlying file table
+// entry — same file, same offset, same open-flags — which is what
+// shell redirection (dup of stdout into a pipe write-end) relies on.
+func handleDup(d *Dispatcher, regs *Regs) Verdict {
+	guestOld := int(regs.X[0])
+	hostOld, ok := d.FDs.Resolve(guestOld)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	hostNew, err := syscall.Dup(hostOld)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(d.FDs.Allocate(hostNew))
+	return VerdictHandled
+}
+
+// handleDup3 services dup3(oldfd, newfd, flags) (NR=24).
+//
+// aarch64 layout: x0 = oldfd, x1 = newfd, x2 = flags (O_CLOEXEC only).
+//
+// Semantics differ from dup2 in two places:
+//   - oldfd == newfd is an error (EINVAL), not a no-op.
+//   - flags are a real mask — only O_CLOEXEC is defined; anything else
+//     is EINVAL.
+//
+// If newfd was already open on the guest side, its host fd is closed
+// after the new host fd is installed. We open-then-close rather than
+// the kernel's close-then-open order because a failure in syscall.Dup
+// must not leave the guest with newfd gone and nothing in its place.
+func handleDup3(d *Dispatcher, regs *Regs) Verdict {
+	guestOld := int(regs.X[0])
+	guestNew := int(regs.X[1])
+	flags := int(regs.X[2])
+
+	if guestOld == guestNew {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	if flags & ^syscall.O_CLOEXEC != 0 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	if guestNew < 0 {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	hostOld, ok := d.FDs.Resolve(guestOld)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+
+	hostNew, err := syscall.Dup(hostOld)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if flags&syscall.O_CLOEXEC != 0 {
+		if _, err := fcntlSetCloexec(hostNew); err != nil {
+			_ = syscall.Close(hostNew)
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	if prevHost, had := d.FDs.AssignAt(guestNew, hostNew); had {
+		_ = syscall.Close(prevHost)
+	}
+	regs.X[0] = uint64(guestNew)
+	return VerdictHandled
+}
+
+// fcntlSetCloexec sets FD_CLOEXEC on a host fd. Extracted so handleDup3
+// stays linear and a future handleFcntl can reuse the helper.
+func fcntlSetCloexec(hostFd int) (int, error) {
+	r, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(hostFd), uintptr(syscall.F_SETFD), uintptr(syscall.FD_CLOEXEC))
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(r), nil
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing

@@ -58,6 +58,22 @@ func (t *FDTable) Resolve(guestFd int) (hostFd int, ok bool) {
 	return host, ok
 }
 
+// AssignAt installs hostFd at a specific guest fd slot and returns any
+// host fd that previously occupied the slot so the caller can close(2)
+// it. Used by dup3, whose contract is "make newfd refer to a copy of
+// oldfd, atomically closing any prior occupant of newfd".
+//
+// Unlike Allocate, the caller picks the guest fd; AssignAt trusts that
+// choice (it doesn't check against rlimit — that's the handler's job
+// if we grow one). Returns had=false when the slot was free.
+func (t *FDTable) AssignAt(guestFd, hostFd int) (prevHost int, had bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prev, ok := t.entries[guestFd]
+	t.entries[guestFd] = hostFd
+	return prev, ok
+}
+
 // Close removes the entry for guestFd and returns the host fd so the
 // caller can close(2) it on the host. Returns ok=false if guestFd was
 // not open. The table never closes the host fd itself — the calling

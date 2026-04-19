@@ -84,6 +84,8 @@ const (
 	// open/stat/access/readlink/mkdir/unlink/rename numbers do NOT
 	// exist on arm64; only the *at variants do).
 	SysGetCwd     uint64 = 17
+	SysDup        uint64 = 23
+	SysDup3       uint64 = 24
 	SysFCntl      uint64 = 25
 	SysIoctl      uint64 = 29
 	SysMkdirAt    uint64 = 34
