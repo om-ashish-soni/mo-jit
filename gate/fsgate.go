@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -60,13 +61,66 @@ func (l Layer) String() string {
 // which is disabled for untrusted_app on every 2026 GKI kernel.
 type FSGate struct {
 	policy Policy
+
+	// cwdMu guards guestCwd. The guest cwd is updated by chdir and
+	// read by every path syscall handler that encounters a relative
+	// path, so contention is shaped like a mostly-reader workload —
+	// an RWMutex is the right primitive.
+	cwdMu    sync.RWMutex
+	guestCwd string
 }
 
 // NewFSGate constructs the filesystem gate. It does not touch the
 // filesystem; validation of LowerDir and UpperDir existence happens at
 // Prepare time (once the runtime is wired in M2).
+//
+// The guest cwd starts at "/". The real ELF loader adjusts it via the
+// chdir handler once the runtime is wired up; tests can drive it via
+// SetGuestCwd directly.
 func NewFSGate(p Policy) *FSGate {
-	return &FSGate{policy: p}
+	return &FSGate{policy: p, guestCwd: "/"}
+}
+
+// GuestCwd returns the guest process's current working directory in
+// GUEST path space (not host). The guest sees "/home/developer"; the
+// host backing for that path resolves through Resolve.
+func (g *FSGate) GuestCwd() string {
+	g.cwdMu.RLock()
+	defer g.cwdMu.RUnlock()
+	return g.guestCwd
+}
+
+// SetGuestCwd replaces the guest cwd. The new path must be absolute
+// (the chdir handler is responsible for validating existence and
+// directory-ness via Resolve + Stat before calling this).
+func (g *FSGate) SetGuestCwd(guestPath string) error {
+	if !filepath.IsAbs(guestPath) {
+		return fmt.Errorf("%w: guest cwd must be absolute: %q", ErrEscape, guestPath)
+	}
+	clean := filepath.Clean(guestPath)
+	g.cwdMu.Lock()
+	g.guestCwd = clean
+	g.cwdMu.Unlock()
+	return nil
+}
+
+// AbsFromGuest returns the absolute guest-space path for a possibly
+// relative guestPath, resolving relative paths against the current
+// guest cwd. The result is cleaned (no `.` / `..` / duplicate slashes)
+// and still guest-space — feed it to Resolve to get a host path.
+//
+// Handlers call this as the first step after ReadPath when the dirfd
+// argument is AT_FDCWD. For explicit dirfds (resolving relative to an
+// open directory handle), M3 will add ResolveAt(dirfd, path) once the
+// fd table exists.
+func (g *FSGate) AbsFromGuest(guestPath string) string {
+	if filepath.IsAbs(guestPath) {
+		return filepath.Clean(guestPath)
+	}
+	g.cwdMu.RLock()
+	cwd := g.guestCwd
+	g.cwdMu.RUnlock()
+	return filepath.Clean(filepath.Join(cwd, guestPath))
 }
 
 // Resolve translates an absolute guest path to the host-side path the
