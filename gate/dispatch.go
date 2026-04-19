@@ -29,6 +29,12 @@ type Dispatcher struct {
 	// gum's in-process memory access; see path_reader.go.
 	Paths PathReader
 
+	// Mem writes handler-produced bytes into the guest's virtual
+	// address space. Used by handlers that return data through a
+	// guest-supplied buffer (getcwd, readlinkat, newfstatat, ...).
+	// NewDispatcher installs NoopMemWriter — see mem_writer.go.
+	Mem MemWriter
+
 	// handlers maps aarch64 syscall number -> Handler. An absent
 	// entry means "we don't intercept this syscall" and the svc hook
 	// passes it through to the kernel.
@@ -42,6 +48,7 @@ func NewDispatcher(p Policy) *Dispatcher {
 		FS:       NewFSGate(p),
 		Net:      NewNetGate(p.Net),
 		Paths:    NoopPathReader{},
+		Mem:      NoopMemWriter{},
 		handlers: make(map[uint64]Handler),
 	}
 	d.registerDefaults()
@@ -99,4 +106,5 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysChDir] = handleChDir
 	d.handlers[SysFAccessAt] = handleFAccessAt
 	d.handlers[SysFAccessAt2] = handleFAccessAt
+	d.handlers[SysGetCwd] = handleGetCwd
 }

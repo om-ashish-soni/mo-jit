@@ -136,3 +136,41 @@ func handleFAccessAt(d *Dispatcher, regs *Regs) Verdict {
 	regs.X[0] = 0
 	return VerdictHandled
 }
+
+// handleGetCwd services sys_getcwd(buf, size) (NR=17).
+//
+// Kernel semantics (NOT libc): returns the byte length of the path
+// INCLUDING the trailing NUL in x0 on success; -errno on failure.
+// Errors: ERANGE if size is too small, EFAULT if buf cannot be
+// written. The glibc/musl wrapper turns this into a char* pointer.
+//
+// Crucially, the handler returns the GUEST cwd (FSGate.GuestCwd), not
+// the host process cwd: the host cwd belongs to the frida-gum host
+// runtime and is meaningless to the guest.
+func handleGetCwd(d *Dispatcher, regs *Regs) Verdict {
+	bufPtr := regs.X[0]
+	size := regs.X[1]
+
+	cwd := d.FS.GuestCwd()
+	// The kernel writes the path plus a trailing NUL. Allocate a new
+	// slice so we own the memory and the NUL is guaranteed; cwd may be
+	// interned in FSGate.
+	out := make([]byte, len(cwd)+1)
+	copy(out, cwd)
+	// out[len(cwd)] is already zero from make.
+
+	if uint64(len(out)) > size {
+		regs.X[0] = EncodeErrno(syscall.ERANGE)
+		return VerdictHandled
+	}
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	if err := d.Mem.WriteBytes(bufPtr, out); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(len(out))
+	return VerdictHandled
+}
