@@ -62,6 +62,40 @@ func (n *NetGate) CheckConnect(addr netip.AddrPort) error {
 	}
 }
 
+// CheckBind is the policy gate for bind(2). Connect and sendto gate
+// the *destination*; bind gates the *local source* address. For a
+// loopback-only guest, a bind to a public interface would expose the
+// guest as an inbound server on the host's public IP — not what the
+// policy promises. So loopback-only requires the bind address to be
+// loopback (127.0.0.1/::1) or the wildcard (0.0.0.0/::). Wildcard
+// itself isn't public-exposing in practice — libc often binds
+// 0.0.0.0:0 for ephemeral source ports during implicit-bind-on-
+// connect — and the kernel picks the route-matched interface when
+// outbound traffic goes out.
+//
+// internet mode accepts any local bind (the danger is outbound
+// destinations, which CheckConnect handles).
+//
+// mode=none rejects AF_INET/AF_INET6 even on bind; in practice
+// AllowSocket already blocks creation, but the defense-in-depth check
+// catches any fd that slipped in some other way.
+func (n *NetGate) CheckBind(addr netip.AddrPort) error {
+	switch n.policy.Mode {
+	case "none", "":
+		return ErrBlockedByPolicy
+	case "loopback-only":
+		a := addr.Addr()
+		if a.IsLoopback() || a.IsUnspecified() {
+			return nil
+		}
+		return ErrBlockedByPolicy
+	case "internet":
+		return nil
+	default:
+		return errors.New("gate: unknown NetPolicy.Mode (want none|loopback-only|internet)")
+	}
+}
+
 // AllowSocket is the policy gate for socket(2): it decides whether the
 // guest is even allowed to ASK for this kind of socket. Per NetPolicy
 // docstring: mode "none" blocks AF_INET / AF_INET6 with EACCES but

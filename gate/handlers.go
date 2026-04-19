@@ -2703,6 +2703,57 @@ func decodeSockaddr(family uint16, buf []byte) (syscall.Sockaddr, netip.AddrPort
 	}
 }
 
+// handleBind services bind(sockfd, addr, addrlen) (NR=200). Shape
+// matches connect: read the sockaddr out of guest memory, decode it,
+// hand it to NetGate.CheckBind, then forward to the host kernel.
+//
+// The difference from connect is policy: bind gates the LOCAL source
+// address (see NetGate.CheckBind), not a remote destination. For
+// loopback-only that means the bind must be loopback or wildcard;
+// for internet any local bind is allowed.
+//
+// AF_UNIX bind would need FSGate path translation (guest->host rootfs
+// mapping) before it can be safe — without that, a bind to "/tmp/x"
+// lands in the host's /tmp, not the guest's rootfs. Deferred: returns
+// ENOSYS, same as connect.
+func handleBind(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	addrPtr := regs.X[1]
+	addrLen := int(regs.X[2])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if addrLen < 2 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	buf, err := d.MemR.ReadBytes(addrPtr, addrLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	family := binary.LittleEndian.Uint16(buf[0:2])
+
+	sa, ap, err := decodeSockaddr(family, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if err := d.Net.CheckBind(ap); err != nil {
+		regs.X[0] = EncodeErrno(syscall.EACCES)
+		return VerdictHandled
+	}
+	if err := syscall.Bind(hostFd, sa); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleSendTo services sendto(sockfd, buf, len, flags, dest_addr,
 // addrlen) (NR=206). write(2) already handles connected sockets; this
 // handler exists for the unconnected-UDP shape — notably musl's DNS
