@@ -137,6 +137,7 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysTruncate] = handleTruncate
 	d.handlers[SysFChMod] = handleFChMod
 	d.handlers[SysFChModAt] = handleFChModAt
+	d.handlers[SysUtimensAt] = handleUtimensAt
 	d.handlers[SysRead] = handleRead
 	d.handlers[SysWrite] = handleWrite
 	d.handlers[SysNewFStatAt] = handleNewFStatAt

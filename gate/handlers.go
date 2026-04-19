@@ -1740,6 +1740,109 @@ func handleFChModAt(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// utimeNow is the magic tv_nsec value that tells utimensat "use the
+// current time for this field" (include/uapi/linux/stat.h — UTIME_NOW).
+const utimeNow = ((1 << 30) - 1)
+
+// handleUtimensAt services utimensat(dirfd, path, times, flags) (NR=88).
+// Touch / make / rsync all lean on this to drive incremental-rebuild
+// logic; missing it means every rebuild thinks the tree is stale.
+//
+// aarch64 layout:
+//
+//	x0 = dirfd, x1 = path (may be NULL for futimens-style),
+//	x2 = times (struct timespec[2] or NULL), x3 = flags.
+//
+// times encoding (reads 32 bytes via MemReader):
+//
+//	[0] atime: tv_sec (8B), tv_nsec (8B)
+//	[1] mtime: tv_sec (8B), tv_nsec (8B)
+//
+// tv_nsec may hold the magic UTIME_NOW or UTIME_OMIT; the kernel
+// interprets those in-struct so we just forward the bytes.
+//
+// Not yet supported (return ENOSYS so missing coverage is loud):
+//   - path == NULL (futimens-style, needs dirfd→hostFd handling)
+//   - AT_SYMLINK_NOFOLLOW (rare; would require raw syscall).
+//
+// Like fchmodat, lower-only files are copied up before the timestamp
+// update so it actually sticks from the guest's next stat.
+func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	timesPtr := regs.X[2]
+	flags := int(regs.X[3])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+	if flags&atSymlinkNoFollow != 0 {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	if pathPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest, ok := absolutiseAt(d, dirfd, path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+
+	var ts []syscall.Timespec
+	if timesPtr != 0 {
+		buf, err := d.MemR.ReadBytes(timesPtr, 32)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		ts = []syscall.Timespec{
+			{Sec: int64(binary.LittleEndian.Uint64(buf[0:8])), Nsec: int64(binary.LittleEndian.Uint64(buf[8:16]))},
+			{Sec: int64(binary.LittleEndian.Uint64(buf[16:24])), Nsec: int64(binary.LittleEndian.Uint64(buf[24:32]))},
+		}
+	} else {
+		// NULL times → current time for both. Go's UtimesNano with nil
+		// slice maps to utimes(..., NULL) which EINVALs under utimensat;
+		// pass two UTIME_NOW timespecs so the kernel stamps now.
+		ts = []syscall.Timespec{
+			{Sec: 0, Nsec: utimeNow},
+			{Sec: 0, Nsec: utimeNow},
+		}
+	}
+	if err := syscall.UtimesNano(hostPath, ts); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing

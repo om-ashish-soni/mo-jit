@@ -109,6 +109,7 @@ const (
 	SysReadLinkAt uint64 = 78
 	SysNewFStatAt uint64 = 79
 	SysFStat      uint64 = 80
+	SysUtimensAt  uint64 = 88
 	SysRenameAt2  uint64 = 276
 	SysFAccessAt2 uint64 = 439
 
