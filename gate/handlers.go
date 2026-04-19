@@ -2606,3 +2606,38 @@ func handleClose(d *Dispatcher, regs *Regs) Verdict {
 	regs.X[0] = 0
 	return VerdictHandled
 }
+
+// handleSocket services socket(domain, type, protocol) (NR=198). Entry
+// point for the NetGate family — nothing else in the net path works
+// until this one allocates a guest fd backed by a real host socket.
+//
+// aarch64 layout: x0 = domain, x1 = type, x2 = protocol.
+//
+// The `type` argument carries SOCK_* flags (SOCK_STREAM, SOCK_DGRAM,
+// SOCK_RAW, ...) in the low bits plus SOCK_CLOEXEC (0x80000) and
+// SOCK_NONBLOCK (0x800) as ORable modifiers. We forward the full mask
+// to the host kernel; libcurl / Go stdlib / musl all set CLOEXEC on
+// the socket syscall itself rather than chasing it with fcntl, so
+// this behaviour matters for fd-inheritance correctness across
+// fork/exec in the guest.
+//
+// Policy lives in NetGate.AllowSocket: mode "none" blocks AF_INET*
+// with EACCES, unknown domains return EAFNOSUPPORT. See netgate.go
+// for why the whitelist is narrow by default.
+func handleSocket(d *Dispatcher, regs *Regs) Verdict {
+	domain := int(regs.X[0])
+	sockType := int(regs.X[1])
+	protocol := int(regs.X[2])
+
+	if err := d.Net.AllowSocket(domain); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	hostFd, err := syscall.Socket(domain, sockType, protocol)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(d.FDs.Allocate(hostFd))
+	return VerdictHandled
+}

@@ -202,4 +202,5 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysUnlinkAt] = handleUnlinkAt
 	d.handlers[SysRenameAt] = handleRenameAt
 	d.handlers[SysRenameAt2] = handleRenameAt
+	d.handlers[SysSocket] = handleSocket
 }

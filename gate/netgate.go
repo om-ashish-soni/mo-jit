@@ -3,6 +3,7 @@ package gate
 import (
 	"errors"
 	"net/netip"
+	"syscall"
 )
 
 // ErrBlockedByPolicy is returned when a net operation is denied by NetPolicy.
@@ -58,6 +59,33 @@ func (n *NetGate) CheckConnect(addr netip.AddrPort) error {
 		return nil
 	default:
 		return errors.New("gate: unknown NetPolicy.Mode (want none|loopback-only|internet)")
+	}
+}
+
+// AllowSocket is the policy gate for socket(2): it decides whether the
+// guest is even allowed to ASK for this kind of socket. Per NetPolicy
+// docstring: mode "none" blocks AF_INET / AF_INET6 with EACCES but
+// leaves AF_UNIX (and anything else inherently local) alone. Modes
+// "loopback-only" and "internet" both permit creation — the actual
+// destination check happens later on connect/bind/sendto.
+//
+// Unknown / unsupported domains (AF_PACKET, AF_NETLINK above what we
+// emulate, etc.) return EAFNOSUPPORT so the guest gets a deterministic
+// errno rather than us silently forwarding to the host kernel. The
+// whitelist is intentionally narrow — widening requires a policy
+// decision (AF_NETLINK in particular lets apps read host routing
+// state we don't want to leak).
+func (n *NetGate) AllowSocket(domain int) error {
+	switch domain {
+	case syscall.AF_INET, syscall.AF_INET6:
+		if n.policy.Mode == "none" {
+			return syscall.EACCES
+		}
+		return nil
+	case syscall.AF_UNIX:
+		return nil
+	default:
+		return syscall.EAFNOSUPPORT
 	}
 }
 
