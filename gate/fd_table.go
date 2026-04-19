@@ -39,9 +39,21 @@ func NewFDTable() *FDTable {
 // Allocate never fails in isolation — the table has no ceiling. A
 // real rlimit check belongs at the caller (the openat handler).
 func (t *FDTable) Allocate(hostFd int) int {
+	return t.AllocateFrom(0, hostFd)
+}
+
+// AllocateFrom is like Allocate but starts scanning at minGuestFd.
+// Used by fcntl(F_DUPFD, min), which guarantees the returned guest
+// fd is >= min. Negative minima clamp to 0 — callers get the same
+// lowest-free behaviour as Allocate.
+func (t *FDTable) AllocateFrom(minGuestFd, hostFd int) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for g := 0; ; g++ {
+	g := minGuestFd
+	if g < 0 {
+		g = 0
+	}
+	for ; ; g++ {
 		if _, taken := t.entries[g]; !taken {
 			t.entries[g] = hostFd
 			return g

@@ -1227,6 +1227,64 @@ func fcntlSetCloexec(hostFd int) (int, error) {
 	return int(r), nil
 }
 
+// handleFcntl services fcntl(fd, cmd, arg) (NR=25). fcntl is a
+// kitchen-sink syscall whose semantics depend on cmd; we only wire up
+// the commands real programs lean on during init. Everything else
+// returns ENOSYS so we notice when a guest reaches for advisory
+// locking, F_NOTIFY, F_PIPE_SZ, or the *_LEASE family.
+//
+// Supported commands:
+//   - F_DUPFD(arg): dup fd to the lowest free guest slot >= arg.
+//   - F_DUPFD_CLOEXEC(arg): same + FD_CLOEXEC on host fd.
+//   - F_GETFD: read FD_CLOEXEC.
+//   - F_SETFD: set FD_CLOEXEC (other bits ignored — Linux F_SETFD
+//     only defines this one flag as of 2026).
+//   - F_GETFL: read open-status flags.
+//   - F_SETFL: set the mutable subset (O_APPEND, O_NONBLOCK, O_ASYNC,
+//     O_DIRECT, O_NOATIME). Kernel silently masks non-mutable bits.
+func handleFcntl(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	cmd := int(regs.X[1])
+	arg := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+
+	switch cmd {
+	case syscall.F_DUPFD, syscall.F_DUPFD_CLOEXEC:
+		hostNew, err := syscall.Dup(hostFd)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		if cmd == syscall.F_DUPFD_CLOEXEC {
+			if _, err := fcntlSetCloexec(hostNew); err != nil {
+				_ = syscall.Close(hostNew)
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+		}
+		regs.X[0] = uint64(d.FDs.AllocateFrom(int(arg), hostNew))
+		return VerdictHandled
+
+	case syscall.F_GETFD, syscall.F_SETFD, syscall.F_GETFL, syscall.F_SETFL:
+		r, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(hostFd), uintptr(cmd), uintptr(arg))
+		if errno != 0 {
+			regs.X[0] = EncodeErrno(errno)
+			return VerdictHandled
+		}
+		regs.X[0] = uint64(r)
+		return VerdictHandled
+
+	default:
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
