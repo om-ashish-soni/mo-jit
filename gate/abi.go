@@ -95,6 +95,8 @@ const (
 	SysChDir      uint64 = 49
 	SysOpenAt     uint64 = 56
 	SysClose      uint64 = 57
+	SysRead       uint64 = 63
+	SysWrite      uint64 = 64
 	SysReadLinkAt uint64 = 78
 	SysNewFStatAt uint64 = 79
 	SysFStat      uint64 = 80

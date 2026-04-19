@@ -31,9 +31,16 @@ type Dispatcher struct {
 
 	// Mem writes handler-produced bytes into the guest's virtual
 	// address space. Used by handlers that return data through a
-	// guest-supplied buffer (getcwd, readlinkat, newfstatat, ...).
+	// guest-supplied buffer (getcwd, readlinkat, newfstatat, read, ...).
 	// NewDispatcher installs NoopMemWriter — see mem_writer.go.
 	Mem MemWriter
+
+	// MemR reads fixed-length byte ranges out of guest address space.
+	// Handlers that source data from a guest-supplied buffer (write,
+	// pwrite, sendmsg iovecs, ioctl struct args) call MemR.ReadBytes.
+	// Separate from Paths because MemR returns raw bytes of a caller-
+	// specified length rather than a NUL-terminated string.
+	MemR MemReader
 
 	// FDs is the guest's file-descriptor table. Preseeded with stdio
 	// (0,1,2 -> host 0,1,2) so early prints survive. Handlers that
@@ -56,6 +63,7 @@ func NewDispatcher(p Policy) *Dispatcher {
 		Net:      NewNetGate(p.Net),
 		Paths:    NoopPathReader{},
 		Mem:      NoopMemWriter{},
+		MemR:     NoopMemReader{},
 		FDs:      NewFDTable(),
 		handlers: make(map[uint64]Handler),
 	}
@@ -118,4 +126,6 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysReadLinkAt] = handleReadLinkAt
 	d.handlers[SysOpenAt] = handleOpenAt
 	d.handlers[SysClose] = handleClose
+	d.handlers[SysRead] = handleRead
+	d.handlers[SysWrite] = handleWrite
 }

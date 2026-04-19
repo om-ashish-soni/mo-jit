@@ -135,6 +135,8 @@ func TestSyscallConstantsMatchAArch64GenericTable(t *testing.T) {
 		{"chdir", SysChDir, 49},
 		{"openat", SysOpenAt, 56},
 		{"close", SysClose, 57},
+		{"read", SysRead, 63},
+		{"write", SysWrite, 64},
 		{"readlinkat", SysReadLinkAt, 78},
 		{"newfstatat", SysNewFStatAt, 79},
 		{"fstat", SysFStat, 80},

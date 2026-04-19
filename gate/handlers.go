@@ -314,6 +314,85 @@ func handleOpenAt(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleRead services read(fd, buf, count) (NR=63).
+//
+// The kernel does the actual I/O against the host fd; the gate's job
+// is to translate the guest fd, read into a Go-owned scratch buffer,
+// and copy that buffer into the guest's address space. Copying via
+// MemWriter instead of handing the kernel a raw guest pointer keeps
+// a consistent story with the rest of the *at handlers: the kernel
+// never sees guest pointers, only gate-owned memory.
+//
+// count == 0 short-circuits to 0 without touching MemWriter — Linux
+// read(2) defines count=0 as a successful no-op returning 0.
+func handleRead(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+	count := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+
+	if count == 0 {
+		regs.X[0] = 0
+		return VerdictHandled
+	}
+
+	buf := make([]byte, count)
+	n, err := syscall.Read(hostFd, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(bufPtr, buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleWrite services write(fd, buf, count) (NR=64).
+//
+// Mirror of handleRead. count == 0 is a successful no-op. Short
+// writes (n < count) propagate to the guest as-is — it's the guest's
+// job to loop if it cares.
+func handleWrite(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+	count := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+
+	if count == 0 {
+		regs.X[0] = 0
+		return VerdictHandled
+	}
+
+	buf, err := d.MemR.ReadBytes(bufPtr, int(count))
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	n, err := syscall.Write(hostFd, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
