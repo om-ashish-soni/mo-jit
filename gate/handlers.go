@@ -1166,6 +1166,81 @@ func handleFStat(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleStatFs services statfs(path, bufp) (NR=43). apt/dpkg call this
+// to decide whether /var/cache/apt has enough room to stage a download;
+// df reads /proc/mounts then statfs's each entry. Without this handler
+// the passthrough would hit the host kernel with a *guest* path,
+// failing with ENOENT (or worse, leaking host-path info).
+//
+// aarch64 layout: x0 = pathname, x1 = buf.
+//
+// Path resolves through FSGate.Resolve so the kernel sees the real
+// backing host path (upper if copied-up, lower otherwise). Whatever
+// filesystem physically holds that backing path is what the guest
+// learns about — which is the correct answer: writes will land there,
+// so its free-space numbers are what actually constrains the guest.
+func handleStatFs(d *Dispatcher, regs *Regs) Verdict {
+	pathPtr := regs.X[0]
+	bufPtr := regs.X[1]
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest := d.FS.AbsFromGuest(path)
+	hostPath, _, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(hostPath, &st); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	if err := d.Mem.WriteBytes(bufPtr, packStatfsAarch64(&st)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFStatFs services fstatfs(fd, bufp) (NR=44). Same shape as
+// handleStatFs but takes a guest fd which we resolve to a host fd.
+//
+// aarch64 layout: x0 = fd, x1 = buf.
+func handleFStatFs(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Fstatfs(hostFd, &st); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	if err := d.Mem.WriteBytes(bufPtr, packStatfsAarch64(&st)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleDup services dup(oldfd) (NR=23).
 //
 // aarch64 layout: x0 = oldfd.

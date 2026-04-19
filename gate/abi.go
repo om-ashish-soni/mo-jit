@@ -101,6 +101,8 @@ const (
 	SysSymlinkAt    uint64 = 36
 	SysLinkAt       uint64 = 37
 	SysRenameAt     uint64 = 38
+	SysStatFs       uint64 = 43
+	SysFStatFs      uint64 = 44
 	SysTruncate     uint64 = 45
 	SysFTruncate    uint64 = 46
 	SysFAccessAt    uint64 = 48
