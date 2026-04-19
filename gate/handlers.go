@@ -489,6 +489,268 @@ func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
 // unlinkat, the syscall behaves like rmdir(2) instead of unlink(2).
 const atRemoveDir = 0x200
 
+// renameat2 flags.
+const (
+	renameNoReplace = 0x1 // RENAME_NOREPLACE — fail with EEXIST if dst present
+	renameExchange  = 0x2 // RENAME_EXCHANGE — atomic swap of two entries
+	renameWhiteout  = 0x4 // RENAME_WHITEOUT — special kernel-internal form
+)
+
+// handleRenameAt services renameat(olddirfd, oldpath, newdirfd, newpath)
+// (NR=38) AND renameat2(..., flags) (NR=276). The two share this
+// single handler; renameat2 differs only by carrying RENAME_*
+// flags in x4. apt/dpkg/git all lean on rename being atomic for
+// crash-safe config writes, so this is a high-value handler even
+// though the cross-layer semantics are genuinely tricky.
+//
+// aarch64 layout:
+//
+//	x0 = olddirfd, x1 = oldpath,
+//	x2 = newdirfd, x3 = newpath,
+//	[x4 = flags (renameat2 only)]
+//
+// Layer handling:
+//   - src on upper (independent of lower): os.Rename upper → upper.
+//     If lower ALSO has src, write a whiteout at the old location
+//     so the lower entry stays hidden from the guest.
+//   - src on lower only: copy lower content into the dst's upper
+//     path (regular file → streamed copy preserving perm bits;
+//     symlink → copy target bytes verbatim). Then whiteout the old
+//     location so the guest stops seeing src there.
+//   - dst on upper (non-whiteout): overwritten by os.Rename on the
+//     upper-on-upper path; explicit os.Remove + then-copy-or-move
+//     on the cross-layer path.
+//   - dst is a whiteout: treat as absent, remove the whiteout so
+//     the rename doesn't EEXIST against the char-dev marker.
+//
+// Flags:
+//   - RENAME_NOREPLACE: EEXIST if dst is visible to the guest (upper
+//     non-whiteout OR lower-not-masked). Whiteout-masked lower is
+//     NOT considered existing.
+//   - RENAME_EXCHANGE: atomic swap. ENOSYS for now — overlay
+//     semantics for EXCHANGE need both entries promoted to upper
+//     with atomic os.Rename, which Go's stdlib doesn't directly
+//     expose. Tracked.
+//   - RENAME_WHITEOUT: kernel-internal, ENOSYS.
+//
+// Directory renames: same-layer (src on upper) is supported via
+// os.Rename. Cross-layer dir rename returns EXDEV — the correct POSIX
+// errno for "try a userspace copy", deferring the recursive copy-up
+// to a follow-up. apt/dpkg/git only rename files atomically, never
+// directories, so this ordering is fine for real workloads.
+//
+// Not modelled yet: whiteout of a source DIR leaves children visible
+// through lower on descendant path lookups, because FSGate.Resolve
+// operates on the full clean path and doesn't walk parents checking
+// for whiteout. That's an M2-level bug shared by every delete-shaped
+// handler; tracked for the opaque-dir follow-up.
+func handleRenameAt(d *Dispatcher, regs *Regs) Verdict {
+	oldDirfd := int64(regs.X[0])
+	oldPtr := regs.X[1]
+	newDirfd := int64(regs.X[2])
+	newPtr := regs.X[3]
+	flags := 0
+	if regs.NR == SysRenameAt2 {
+		flags = int(regs.X[4])
+	}
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+	if flags&(renameExchange|renameWhiteout) != 0 {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	oldPath, err := d.Paths.ReadPath(oldPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	newPath, err := d.Paths.ReadPath(newPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	oldAbs, ok := absolutiseAt(d, oldDirfd, oldPath)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	newAbs, ok := absolutiseAt(d, newDirfd, newPath)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	if oldAbs == newAbs {
+		// rename(x, x) is a no-op on Linux.
+		regs.X[0] = 0
+		return VerdictHandled
+	}
+
+	upperDir := d.FS.policy.UpperDir
+	lowerDir := d.FS.policy.LowerDir
+	oldUpper := filepath.Join(upperDir, oldAbs)
+	newUpper := filepath.Join(upperDir, newAbs)
+	var oldLower, newLower string
+	if lowerDir != "" {
+		oldLower = filepath.Join(lowerDir, oldAbs)
+		newLower = filepath.Join(lowerDir, newAbs)
+	}
+
+	oldInfo, oldUpperErr := os.Lstat(oldUpper)
+	oldIsWhiteout := oldUpperErr == nil && isWhiteoutPath(oldUpper, oldInfo)
+	oldOnUpper := oldUpperErr == nil && !oldIsWhiteout
+
+	var oldLowerInfo os.FileInfo
+	oldOnLower := false
+	if oldLower != "" {
+		if li, err := os.Lstat(oldLower); err == nil {
+			oldLowerInfo = li
+			oldOnLower = true
+		}
+	}
+
+	// Guest's view of src: present iff upper has it OR (lower has it
+	// AND upper doesn't mask it with a whiteout).
+	srcVisible := oldOnUpper || (oldOnLower && !oldIsWhiteout)
+	if !srcVisible {
+		regs.X[0] = EncodeErrno(syscall.ENOENT)
+		return VerdictHandled
+	}
+
+	newInfo, newUpperErr := os.Lstat(newUpper)
+	newIsWhiteout := newUpperErr == nil && isWhiteoutPath(newUpper, newInfo)
+	newOnUpper := newUpperErr == nil && !newIsWhiteout
+	newOnLower := false
+	if newLower != "" {
+		if _, err := os.Lstat(newLower); err == nil {
+			newOnLower = true
+		}
+	}
+	dstVisible := newOnUpper || (newOnLower && !newIsWhiteout)
+
+	if flags&renameNoReplace != 0 && dstVisible {
+		regs.X[0] = EncodeErrno(syscall.EEXIST)
+		return VerdictHandled
+	}
+
+	var srcInfo os.FileInfo
+	if oldOnUpper {
+		srcInfo = oldInfo
+	} else {
+		srcInfo = oldLowerInfo
+	}
+
+	// Cross-layer dir rename would need a recursive copy-up; EXDEV
+	// tells userspace "fall back to copy + unlink".
+	if srcInfo.IsDir() && !oldOnUpper {
+		regs.X[0] = EncodeErrno(syscall.EXDEV)
+		return VerdictHandled
+	}
+
+	if err := os.MkdirAll(filepath.Dir(newUpper), 0o755); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	// Clear any whiteout at dst so os.Rename / os.Symlink / the
+	// copyRegularFile helper below don't EEXIST against the char-dev
+	// marker.
+	if newIsWhiteout {
+		if err := os.Remove(newUpper); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+
+	if oldOnUpper {
+		// Same-layer rename. os.Rename gives us atomicity on the
+		// upper fs, which is what apt's .dpkg-new → target dance
+		// actually cares about.
+		if err := os.Rename(oldUpper, newUpper); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	} else {
+		// src is lower-only. Materialise content at newUpper.
+		switch {
+		case srcInfo.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(oldLower)
+			if err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+			// If dst upper has something non-whiteout, remove it
+			// first — os.Symlink won't overwrite.
+			if newOnUpper {
+				if err := os.Remove(newUpper); err != nil {
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+			if err := os.Symlink(target, newUpper); err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+		case srcInfo.Mode().IsRegular():
+			// copyRegularFile uses O_EXCL, so overwrite requires
+			// clearing the existing upper entry first.
+			if newOnUpper {
+				if err := os.Remove(newUpper); err != nil {
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+			if err := copyRegularFile(oldLower, newUpper, srcInfo.Mode().Perm()); err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+		default:
+			regs.X[0] = EncodeErrno(syscall.EOPNOTSUPP)
+			return VerdictHandled
+		}
+	}
+
+	// Hide the old location from the guest if lower still has it
+	// there. No whiteout needed if src was upper-only — the rename
+	// already cleared the old upper entry.
+	if oldOnLower {
+		if err := os.MkdirAll(filepath.Dir(oldUpper), 0o755); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		// oldUpper may still exist when src was on BOTH layers: the
+		// os.Rename moved upper-src away, so the path is free for a
+		// whiteout. If src was upper-only, oldOnLower is false and we
+		// don't enter this branch.
+		if err := writeWhiteout(oldUpper); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// absolutiseAt is the small DRY extraction shared by handlers that
+// need (dirfd, path) → absolute guest path with the same dir-relative-
+// real-dirfd-is-ENOSYS rule every other *at syscall uses.
+func absolutiseAt(d *Dispatcher, dirfd int64, path string) (string, bool) {
+	switch {
+	case filepath.IsAbs(path):
+		return filepath.Clean(path), true
+	case dirfd == int64(atFDCWD):
+		return d.FS.AbsFromGuest(path), true
+	default:
+		return "", false
+	}
+}
+
 // handleUnlinkAt services unlinkat(dirfd, pathname, flags) (NR=35).
 //
 // aarch64 layout:
