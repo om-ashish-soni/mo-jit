@@ -320,6 +320,20 @@ func handleOpenAt(d *Dispatcher, regs *Regs) Verdict {
 	}
 
 	guestFd := d.FDs.Allocate(hostFd)
+
+	// Directory opens get a pre-built overlay-merged dirent stream so
+	// the first getdents64 sees upper+lower union, whiteouts filtered,
+	// opaque markers honoured. A snapshot returns nil when neither
+	// layer resolves as a directory (caller opened a non-dir or a
+	// path whose on-disk type isn't a directory); in that case we
+	// leave the fd snapshot-less and getdents64 will fall through to
+	// raw host readdir — which will usually surface ENOTDIR anyway.
+	if info, statErr := os.Stat(hostPath); statErr == nil && info.IsDir() {
+		if snap, err := buildDirSnapshot(d, absGuest); err == nil && snap != nil {
+			d.setDirSnapshot(guestFd, snap)
+		}
+	}
+
 	regs.X[0] = uint64(guestFd)
 	return VerdictHandled
 }
@@ -1565,6 +1579,27 @@ func handleGetDents64(d *Dispatcher, regs *Regs) Verdict {
 		return VerdictHandled
 	}
 
+	// Overlay-aware path: this fd was opened via handleOpenAt on a
+	// directory, so we have a pre-built merged dirent stream.
+	if snap := d.takeDirSnapshot(guestFd); snap != nil {
+		chunk, errno := serveDirSnapshot(snap, int(count))
+		if errno != 0 {
+			regs.X[0] = EncodeErrno(errno)
+			return VerdictHandled
+		}
+		if len(chunk) > 0 {
+			if err := d.Mem.WriteBytes(bufPtr, chunk); err != nil {
+				// Rewind the cursor so the guest can retry. Without
+				// this, a transient fault would silently eat entries.
+				snap.off -= len(chunk)
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+		}
+		regs.X[0] = uint64(len(chunk))
+		return VerdictHandled
+	}
+
 	buf := make([]byte, count)
 	n, err := syscall.ReadDirent(hostFd, buf)
 	if err != nil {
@@ -1943,6 +1978,9 @@ func handleClose(d *Dispatcher, regs *Regs) Verdict {
 		regs.X[0] = EncodeErrno(syscall.EBADF)
 		return VerdictHandled
 	}
+	// Release any overlay directory snapshot pinned under this fd.
+	// No-op for non-directory fds.
+	d.dropDirSnapshot(guestFd)
 	if err := syscall.Close(hostFd); err != nil {
 		regs.X[0] = EncodeErrno(err)
 		return VerdictHandled

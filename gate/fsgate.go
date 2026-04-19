@@ -334,6 +334,23 @@ func copyRegularFile(src, dst string, perm os.FileMode) error {
 // permanent case for untrusted_app on 2026 GKI kernels.
 const whiteoutXattr = "user.overlay.whiteout"
 
+// opaqueXattr marks an upper directory as "shadow the lower entirely"
+// — readdir on this dir returns upper's entries only, ignoring every
+// name on lower. Kernel overlayfs uses trusted.overlay.opaque; we
+// can't set trusted.* as a regular user, so we mirror fuse-overlayfs
+// and live in user.*.
+const opaqueXattr = "user.overlay.opaque"
+
+// isOpaqueDir reports whether dir (a host path on the upper layer)
+// carries the opaque marker. A missing xattr returns false; any other
+// Getxattr error (ENOTSUP, EACCES) also returns false since we can't
+// know — callers treat unknown as "not opaque" to preserve visibility.
+func isOpaqueDir(dir string) bool {
+	buf := make([]byte, 1)
+	_, err := syscall.Getxattr(dir, opaqueXattr, buf)
+	return err == nil
+}
+
 // isWhiteout reports whether info alone unambiguously represents an
 // overlay whiteout. Today that means the classic char-device-with-rdev-0
 // form; the xattr form is detected via isWhiteoutPath, which also needs

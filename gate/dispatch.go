@@ -1,5 +1,7 @@
 package gate
 
+import "sync"
+
 // Dispatcher is the in-process syscall dispatcher invoked by gum's
 // svc hook. It owns the gates (FS, Net) and a handler table keyed by
 // aarch64 syscall number. Every intercepted `svc #0` lands in
@@ -53,22 +55,63 @@ type Dispatcher struct {
 	// entry means "we don't intercept this syscall" and the svc hook
 	// passes it through to the kernel.
 	handlers map[uint64]Handler
+
+	// dirSnapshots holds pre-built linux_dirent64 streams keyed by
+	// guest directory fd. Directories opened via handleOpenAt get a
+	// snapshot built at open time that respects overlay semantics
+	// (whiteouts, opaque markers, upper-shadows-lower); handleGetDents64
+	// serves chunks from here and handleClose cleans up. Directory fds
+	// that somehow bypass the snapshot builder fall back to a raw
+	// host-fd readdir — fine for pure-upper or pure-lower scenarios
+	// but loses overlay merging.
+	dirSnapshotsMu sync.Mutex
+	dirSnapshots   map[int]*dirSnapshot
 }
 
 // NewDispatcher builds a Dispatcher for a given Policy, constructing
 // the underlying gates and installing the default handler table.
 func NewDispatcher(p Policy) *Dispatcher {
 	d := &Dispatcher{
-		FS:       NewFSGate(p),
-		Net:      NewNetGate(p.Net),
-		Paths:    NoopPathReader{},
-		Mem:      NoopMemWriter{},
-		MemR:     NoopMemReader{},
-		FDs:      NewFDTable(),
-		handlers: make(map[uint64]Handler),
+		FS:           NewFSGate(p),
+		Net:          NewNetGate(p.Net),
+		Paths:        NoopPathReader{},
+		Mem:          NoopMemWriter{},
+		MemR:         NoopMemReader{},
+		FDs:          NewFDTable(),
+		handlers:     make(map[uint64]Handler),
+		dirSnapshots: make(map[int]*dirSnapshot),
 	}
 	d.registerDefaults()
 	return d
+}
+
+// setDirSnapshot installs a pre-built linux_dirent64 stream under a
+// guest directory fd. Replaces any prior snapshot for the same fd —
+// happens when a guest fd is reused after close.
+func (d *Dispatcher) setDirSnapshot(guestFd int, buf []byte) {
+	d.dirSnapshotsMu.Lock()
+	defer d.dirSnapshotsMu.Unlock()
+	d.dirSnapshots[guestFd] = &dirSnapshot{buf: buf}
+}
+
+// takeDirSnapshot removes and returns the snapshot for a guest fd.
+// Returns nil if the fd has no snapshot (non-overlay dir or a
+// non-directory fd). Callers use the returned pointer to advance the
+// cursor; the map no longer holds a reference after take, so close
+// paths don't need to clean up again.
+func (d *Dispatcher) takeDirSnapshot(guestFd int) *dirSnapshot {
+	d.dirSnapshotsMu.Lock()
+	defer d.dirSnapshotsMu.Unlock()
+	s := d.dirSnapshots[guestFd]
+	return s
+}
+
+// dropDirSnapshot forgets the snapshot for a guest fd. Called from
+// handleClose. A missing fd is a no-op.
+func (d *Dispatcher) dropDirSnapshot(guestFd int) {
+	d.dirSnapshotsMu.Lock()
+	defer d.dirSnapshotsMu.Unlock()
+	delete(d.dirSnapshots, guestFd)
 }
 
 // Register installs or replaces the handler for an aarch64 syscall
