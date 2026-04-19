@@ -135,6 +135,9 @@ const (
 	SysGetPeerName uint64 = 205
 	SysSendTo      uint64 = 206
 	SysRecvFrom    uint64 = 207
+	SysSetSockOpt  uint64 = 208
+	SysGetSockOpt  uint64 = 209
+	SysShutdown    uint64 = 210
 	SysSendMsg     uint64 = 211
 	SysRecvMsg     uint64 = 212
 	SysAccept4     uint64 = 242

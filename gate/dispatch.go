@@ -212,4 +212,7 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysRecvFrom] = handleRecvFrom
 	d.handlers[SysGetSockName] = handleGetSockName
 	d.handlers[SysGetPeerName] = handleGetPeerName
+	d.handlers[SysShutdown] = handleShutdown
+	d.handlers[SysSetSockOpt] = handleSetSockOpt
+	d.handlers[SysGetSockOpt] = handleGetSockOpt
 }

@@ -2942,6 +2942,147 @@ func encodeSockaddr(sa syscall.Sockaddr) ([]byte, error) {
 	}
 }
 
+// handleShutdown services shutdown(sockfd, how) (NR=210). Pure
+// passthrough aside from fd resolution: the guest is closing half-
+// or-full of a connection it already owns, and there is nothing
+// about that for policy to veto.
+func handleShutdown(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	how := int(regs.X[1])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Shutdown(hostFd, how); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// maxSockOptLen caps the setsockopt/getsockopt optval copy size at
+// 4 KiB. Real options are tiny (bools, ints, struct linger, struct
+// timeval); libc rarely pushes past 64 bytes. The cap stops a
+// malicious guest from tricking the gate into allocating arbitrary
+// host memory from a single syscall.
+const maxSockOptLen = 4096
+
+// handleSetSockOpt services setsockopt(sockfd, level, optname, optval,
+// optlen) (NR=208). No policy: the guest is configuring its own fd.
+// We copy optval out of guest memory (capped at maxSockOptLen) and
+// hand it to the kernel verbatim. The kernel rejects nonsense.
+func handleSetSockOpt(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	level := int(regs.X[1])
+	optname := int(regs.X[2])
+	optvalPtr := regs.X[3]
+	optlen := int(regs.X[4])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if optlen < 0 || optlen > maxSockOptLen {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	var val []byte
+	if optlen > 0 {
+		b, err := d.MemR.ReadBytes(optvalPtr, optlen)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		val = b
+	}
+	if err := syscall.SetsockoptString(hostFd, level, optname, string(val)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleGetSockOpt services getsockopt(sockfd, level, optname, optval,
+// optlen_ptr) (NR=209). Allocates a host-side buffer sized by the
+// guest's *optlen (capped), calls the kernel, copies the result back
+// through MemWriter, and updates *optlen to the kernel-reported
+// length.
+func handleGetSockOpt(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	level := int(regs.X[1])
+	optname := int(regs.X[2])
+	optvalPtr := regs.X[3]
+	optlenPtr := regs.X[4]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if optlenPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+	lb, err := d.MemR.ReadBytes(optlenPtr, 4)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	glen := int(binary.LittleEndian.Uint32(lb))
+	if glen < 0 || glen > maxSockOptLen {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+
+	buf := make([]byte, glen)
+	// GetsockoptString is conspicuously absent from Go's stdlib for
+	// arbitrary opts — use the raw syscall so we don't have to pick
+	// a typed variant per optname. The vLen in/out-param reports the
+	// real length written.
+	vLen := uint32(glen)
+	var bufPtr uintptr
+	if glen > 0 {
+		bufPtr = uintptr(unsafe.Pointer(&buf[0]))
+	}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_GETSOCKOPT,
+		uintptr(hostFd),
+		uintptr(level),
+		uintptr(optname),
+		bufPtr,
+		uintptr(unsafe.Pointer(&vLen)),
+		0,
+	)
+	if errno != 0 {
+		regs.X[0] = EncodeErrno(errno)
+		return VerdictHandled
+	}
+
+	n := int(vLen)
+	if n > glen {
+		n = glen
+	}
+	if optvalPtr != 0 && n > 0 {
+		if err := d.Mem.WriteBytes(optvalPtr, buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	var out [4]byte
+	binary.LittleEndian.PutUint32(out[:], vLen)
+	if err := d.Mem.WriteBytes(optlenPtr, out[:]); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleListen services listen(sockfd, backlog) (NR=201). No policy:
 // turning a bound socket into a passive listener isn't a destination
 // decision — bind already vetted the local address. Pass through to
