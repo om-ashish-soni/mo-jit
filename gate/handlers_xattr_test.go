@@ -284,6 +284,169 @@ func TestFSetXattrOnHostFd(t *testing.T) {
 	}
 }
 
+func TestListXattrReturnsNames(t *testing.T) {
+	d, paths, _, mw := newXattrHarness(t, true)
+	path := filepath.Join(d.FS.policy.UpperDir, "f")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !xattrSupported(path) {
+		t.Skip("fs lacks user.* xattrs")
+	}
+	if err := syscall.Setxattr(path, "user.a", []byte("1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Setxattr(path, "user.b", []byte("2"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	paths.Entries[0xB100] = "/f"
+	regs := &Regs{NR: SysListXattr}
+	regs.X[0] = 0xB100
+	regs.X[1] = 0xB200
+	regs.X[2] = 256
+	d.Dispatch(regs)
+	n := int64(regs.X[0])
+	if n <= 0 {
+		t.Fatalf("listxattr returned %d", n)
+	}
+	raw := mw.Read(0xB200, int(n))
+	// Split NUL-separated (trailing NUL too).
+	names := map[string]bool{}
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == 0 {
+			names[string(raw[start:i])] = true
+			start = i + 1
+		}
+	}
+	for _, want := range []string{"user.a", "user.b"} {
+		if !names[want] {
+			t.Errorf("missing %q in list; got %v", want, names)
+		}
+	}
+}
+
+func TestRemoveXattrOnUpperFile(t *testing.T) {
+	d, paths, _, _ := newXattrHarness(t, true)
+	path := filepath.Join(d.FS.policy.UpperDir, "f")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !xattrSupported(path) {
+		t.Skip("fs lacks user.* xattrs")
+	}
+	if err := syscall.Setxattr(path, "user.bye", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	paths.Entries[0xB300] = "/f"
+	paths.Entries[0xB301] = "user.bye"
+	regs := &Regs{NR: SysRemoveXattr}
+	regs.X[0] = 0xB300
+	regs.X[1] = 0xB301
+	d.Dispatch(regs)
+	if int64(regs.X[0]) != 0 {
+		t.Fatalf("removexattr returned %d", int64(regs.X[0]))
+	}
+	buf := make([]byte, 8)
+	if _, err := syscall.Getxattr(path, "user.bye", buf); err == nil {
+		t.Errorf("xattr still present after removexattr")
+	}
+}
+
+func TestRemoveXattrCopiesUpLowerFile(t *testing.T) {
+	d, paths, _, _ := newXattrHarness(t, true)
+	if !xattrSupported(d.FS.policy.LowerDir) {
+		t.Skip("fs lacks user.* xattrs")
+	}
+	lower := filepath.Join(d.FS.policy.LowerDir, "l.so")
+	if err := os.WriteFile(lower, []byte("BINARY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Setxattr(lower, "user.cap", []byte("C"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	paths.Entries[0xB400] = "/l.so"
+	paths.Entries[0xB401] = "user.cap"
+	regs := &Regs{NR: SysRemoveXattr}
+	regs.X[0] = 0xB400
+	regs.X[1] = 0xB401
+	d.Dispatch(regs)
+	if int64(regs.X[0]) != 0 {
+		t.Fatalf("removexattr returned %d", int64(regs.X[0]))
+	}
+	// Lower kept its xattr.
+	buf := make([]byte, 8)
+	if _, err := syscall.Getxattr(lower, "user.cap", buf); err != nil {
+		t.Errorf("lower xattr lost: %v", err)
+	}
+	// Upper copy doesn't.
+	upper := filepath.Join(d.FS.policy.UpperDir, "l.so")
+	if _, err := syscall.Getxattr(upper, "user.cap", buf); err == nil {
+		t.Errorf("upper still has the xattr that was supposed to be removed")
+	}
+}
+
+func TestFListFRemoveXattrOnHostFd(t *testing.T) {
+	d, paths, _, mw := newXattrHarness(t, true)
+	path := filepath.Join(d.FS.policy.UpperDir, "f")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !xattrSupported(path) {
+		t.Skip("fs lacks user.* xattrs")
+	}
+	if err := syscall.Setxattr(path, "user.fd1", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	hostFd, err := syscall.Open(path, syscall.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(hostFd) })
+	g := d.FDs.Allocate(hostFd)
+
+	// flistxattr must find user.fd1.
+	regs := &Regs{NR: SysFListXattr}
+	regs.X[0] = uint64(g)
+	regs.X[1] = 0xB500
+	regs.X[2] = 256
+	d.Dispatch(regs)
+	if int64(regs.X[0]) <= 0 {
+		t.Fatalf("flistxattr returned %d", int64(regs.X[0]))
+	}
+	raw := mw.Read(0xB500, int(regs.X[0]))
+	hasIt := false
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == 0 {
+			if string(raw[start:i]) == "user.fd1" {
+				hasIt = true
+			}
+			start = i + 1
+		}
+	}
+	if !hasIt {
+		t.Errorf("flistxattr output missing user.fd1: %v", raw)
+	}
+
+	// fremovexattr it, then re-check.
+	paths.Entries[0xB601] = "user.fd1"
+	rm := &Regs{NR: SysFRemoveXattr}
+	rm.X[0] = uint64(g)
+	rm.X[1] = 0xB601
+	d.Dispatch(rm)
+	if int64(rm.X[0]) != 0 {
+		t.Fatalf("fremovexattr returned %d", int64(rm.X[0]))
+	}
+	buf := make([]byte, 8)
+	if _, err := syscall.Getxattr(path, "user.fd1", buf); err == nil {
+		t.Errorf("fremovexattr didn't actually remove the attr")
+	}
+}
+
 func TestFGetXattrUnknownFdIsEBADF(t *testing.T) {
 	d, paths, _, _ := newXattrHarness(t, true)
 	paths.Entries[0xA181] = "user.any"

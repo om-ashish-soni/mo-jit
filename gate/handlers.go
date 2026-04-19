@@ -2227,6 +2227,198 @@ func fsetxattr(fd int, name string, value []byte, flags int) error {
 	return nil
 }
 
+// handleListXattr services listxattr(path, list, size) (NR=11).
+// Returns the total byte count of NUL-separated attribute names.
+// Pure read — no copy-up. Overlay namespace: we forward whatever the
+// host returns; the merged list across upper+lower isn't implemented
+// yet, so the guest sees exactly the layer Resolve picked.
+//
+// TODO: strip user.overlay.* from the list so the guest never sees
+// our internal opaque/whiteout markers even if someone manages to
+// listxattr the upper dir directly through a bind.
+func handleListXattr(d *Dispatcher, regs *Regs) Verdict {
+	path, err := d.Paths.ReadPath(regs.X[0], MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	size := int(regs.X[2])
+	absGuest, ok := absolutiseAt(d, int64(atFDCWD), path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	hostPath, _, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if size == 0 {
+		n, err := syscall.Listxattr(hostPath, nil)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		regs.X[0] = uint64(n)
+		return VerdictHandled
+	}
+	buf := make([]byte, size)
+	n, err := syscall.Listxattr(hostPath, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(regs.X[1], buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleFListXattr services flistxattr(fd, list, size) (NR=13). Pure
+// host-fd passthrough — the layer decision rode in at open time.
+func handleFListXattr(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	size := int(regs.X[2])
+	if size == 0 {
+		n, err := flistxattr(hostFd, nil)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		regs.X[0] = uint64(n)
+		return VerdictHandled
+	}
+	buf := make([]byte, size)
+	n, err := flistxattr(hostFd, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(regs.X[1], buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleRemoveXattr services removexattr(path, name) (NR=14). Write
+// operation → copy-up for lower paths before issuing the removal.
+func handleRemoveXattr(d *Dispatcher, regs *Regs) Verdict {
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+	path, err := d.Paths.ReadPath(regs.X[0], MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest, ok := absolutiseAt(d, int64(atFDCWD), path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+	if err := syscall.Removexattr(hostPath, name); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFRemoveXattr services fremovexattr(fd, name) (NR=16). Host-fd
+// passthrough, same caveat as fsetxattr: if the guest fd points at
+// lower we don't refuse it — the host kernel will.
+func handleFRemoveXattr(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	name, err := d.Paths.ReadPath(regs.X[1], xattrNameMax)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if err := fremovexattr(hostFd, name); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// flistxattr / fremovexattr wrap the fd-based xattr syscalls that
+// aren't typed in Go's syscall package on linux/arm64.
+func flistxattr(fd int, buf []byte) (int, error) {
+	var bufPtr unsafe.Pointer
+	if len(buf) > 0 {
+		bufPtr = unsafe.Pointer(&buf[0])
+	}
+	r, _, errno := syscall.Syscall(
+		syscall.SYS_FLISTXATTR,
+		uintptr(fd),
+		uintptr(bufPtr),
+		uintptr(len(buf)),
+	)
+	if errno != 0 {
+		return int(r), errno
+	}
+	return int(r), nil
+}
+
+func fremovexattr(fd int, name string) error {
+	nameBytes, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(
+		syscall.SYS_FREMOVEXATTR,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(nameBytes)),
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing

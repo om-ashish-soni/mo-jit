@@ -296,12 +296,58 @@ func (g *FSGate) CopyUp(guestPath string) (string, error) {
 		if err := copyRegularFile(lowerPath, upperPath, srcInfo.Mode().Perm()); err != nil {
 			return "", err
 		}
+		// Propagate user.* xattrs so capabilities, SELinux contexts,
+		// and rsync -X metadata survive the first write. A failure
+		// here isn't fatal — the copy already succeeded, and on
+		// filesystems without xattr support there's nothing to copy.
+		_ = copyAllXattrs(lowerPath, upperPath)
 	default:
 		return "", fmt.Errorf("gate: copy-up unsupported for %q (mode %v)",
 			guestPath, srcInfo.Mode())
 	}
 
 	return upperPath, nil
+}
+
+// copyAllXattrs mirrors every user-visible xattr from src to dst.
+// Read buffer grows to fit the whole list in one shot; the upper
+// bound is XATTR_LIST_MAX (64 KiB) which is small enough that a
+// fixed allocation is fine. Per-attr values can exceed 64 KiB on
+// some filesystems — start with 4 KiB and grow on ERANGE.
+func copyAllXattrs(src, dst string) error {
+	listBuf := make([]byte, 64*1024)
+	n, err := syscall.Listxattr(src, listBuf)
+	if err != nil || n <= 0 {
+		return err
+	}
+	// Names are NUL-separated; split and copy each.
+	start := 0
+	for i := 0; i < n; i++ {
+		if listBuf[i] != 0 {
+			continue
+		}
+		name := string(listBuf[start:i])
+		start = i + 1
+		if name == "" {
+			continue
+		}
+		valBuf := make([]byte, 4096)
+		for {
+			m, err := syscall.Getxattr(src, name, valBuf)
+			if err == syscall.ERANGE {
+				valBuf = make([]byte, len(valBuf)*2)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := syscall.Setxattr(dst, name, valBuf[:m], 0); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // copyRegularFile streams src to dst with O_EXCL to refuse clobbering

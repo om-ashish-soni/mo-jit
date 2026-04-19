@@ -167,6 +167,10 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysSetXattr] = handleSetXattr
 	d.handlers[SysFGetXattr] = handleFGetXattr
 	d.handlers[SysFSetXattr] = handleFSetXattr
+	d.handlers[SysListXattr] = handleListXattr
+	d.handlers[SysFListXattr] = handleFListXattr
+	d.handlers[SysRemoveXattr] = handleRemoveXattr
+	d.handlers[SysFRemoveXattr] = handleFRemoveXattr
 	d.handlers[SysFAccessAt] = handleFAccessAt
 	d.handlers[SysFAccessAt2] = handleFAccessAt
 	d.handlers[SysGetCwd] = handleGetCwd
