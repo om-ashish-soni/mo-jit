@@ -472,12 +472,14 @@ func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
 	// lower; Resolve joins paths without statting). We still need to
 	// probe both layers for a real inode before deciding EEXIST.
 	hostPath, _, rerr := d.FS.Resolve(absGuest)
+	replacingWhiteout := false
 	switch {
 	case errors.Is(rerr, ErrWhiteout):
 		if err := os.Remove(upperPath); err != nil {
 			regs.X[0] = EncodeErrno(err)
 			return VerdictHandled
 		}
+		replacingWhiteout = true
 		// Whiteout removed — treat path as free and fall through.
 	case rerr != nil:
 		regs.X[0] = EncodeErrno(rerr)
@@ -496,6 +498,16 @@ func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
 	if err := os.Mkdir(upperPath, os.FileMode(mode&0o7777)); err != nil {
 		regs.X[0] = EncodeErrno(err)
 		return VerdictHandled
+	}
+	// If we just replaced a whiteout, the lower layer may still hold a
+	// directory at the same guest path. Without the opaque marker its
+	// children would leak back through readdir — a surprise for the
+	// guest that just "rm -rf'd" the dir. Stamp opaque so the merge
+	// skips lower entirely. Ignore xattr errors (EROFS, ENOTSUP): on
+	// filesystems that can't hold user.* xattrs we can't give the full
+	// guarantee, but the mkdir itself should still succeed.
+	if replacingWhiteout {
+		_ = syscall.Setxattr(upperPath, opaqueXattr, []byte{'y'}, 0)
 	}
 	regs.X[0] = 0
 	return VerdictHandled

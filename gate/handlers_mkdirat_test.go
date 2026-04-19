@@ -127,6 +127,33 @@ func TestMkdirAtOverWhiteoutSucceeds(t *testing.T) {
 	}
 }
 
+// TestMkdirAtOverWhiteoutStampsOpaque pins the correctness fix for
+// "rm -rf dir && mkdir dir": without the opaque marker, the lower
+// subtree's children leak back through readdir into the fresh dir.
+func TestMkdirAtOverWhiteoutStampsOpaque(t *testing.T) {
+	h := newMkdirHarness(t, true)
+	mustMkdirAll(t, filepath.Join(h.lower, "d"))
+	if err := os.WriteFile(filepath.Join(h.lower, "d", "leaked"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok := mustWhiteout(t, filepath.Join(h.upper, "d")); !ok {
+		return
+	}
+
+	r := h.mkdir(0x800A, "/d", int64(atFDCWD), 0o755)
+	if int64(r.X[0]) != 0 {
+		t.Fatalf("mkdir over whiteout: X[0]=%d", int64(r.X[0]))
+	}
+
+	buf := make([]byte, 1)
+	if _, err := syscall.Getxattr(filepath.Join(h.upper, "d"), opaqueXattr, buf); err != nil {
+		if err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP {
+			t.Skipf("filesystem lacks user.* xattrs: %v", err)
+		}
+		t.Errorf("opaque xattr missing on replacement dir: %v", err)
+	}
+}
+
 func TestMkdirAtDirRelativeWithRealDirfdReturnsENOSYS(t *testing.T) {
 	h := newMkdirHarness(t, true)
 	r := h.mkdir(0x8007, "relative", 0, 0o755)
