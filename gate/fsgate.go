@@ -3,6 +3,7 @@ package gate
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +69,13 @@ type FSGate struct {
 	// an RWMutex is the right primitive.
 	cwdMu    sync.RWMutex
 	guestCwd string
+
+	// copyUpMu serialises CopyUp so two writable opens of the same
+	// lower file can't race to create two upper copies with disjoint
+	// contents. A per-path mutex would scale better, but copy-up is
+	// a cold path (once per writable lower file, for the process
+	// lifetime) so a single mutex is fine.
+	copyUpMu sync.Mutex
 }
 
 // NewFSGate constructs the filesystem gate. It does not touch the
@@ -207,6 +215,116 @@ func (g *FSGate) matchBind(cleanGuestPath string) (string, bool) {
 		return "", false
 	}
 	return bestHost, true
+}
+
+// ErrNoUpperLayer is returned by CopyUp when the policy has no
+// UpperDir configured. The openat handler uses this to distinguish a
+// truly read-only overlay (surface as EROFS to the guest) from a
+// transient copy-up failure (surface the underlying errno).
+var ErrNoUpperLayer = errors.New("gate: copy-up requires UpperDir")
+
+// CopyUp ensures guestPath exists on the upper layer with the same
+// content as its lower-layer backing, then returns the upper host
+// path. Idempotent: if guestPath is already on upper (not a
+// whiteout), returns the existing upper path without re-copying.
+//
+// Copy-up is overlayfs's answer to "writable lower layer": before a
+// write can happen, the file is promoted to upper so the lower base
+// remains immutable. The gate reimplements it in userspace because
+// kernel overlayfs is unavailable without CONFIG_USER_NS on the 2026
+// GKI kernels we target.
+//
+// Coverage:
+//   - Regular files: streamed io.Copy, preserving the permission
+//     bits. Ownership is NOT preserved (chown needs CAP_CHOWN; the
+//     upper copy is owned by the host process).
+//   - Symlinks: the link itself is copied via os.Symlink. The target
+//     bytes are preserved verbatim, NOT dereferenced.
+//   - Everything else (directories, char/block devices, fifos,
+//     sockets): not currently supported — CopyUp returns an error
+//     and the caller surfaces EOPNOTSUPP.
+//
+// Parent directories on upper are created with mode 0o755 rather
+// than mirroring the lower parent's mode, since mirroring a
+// restrictive lower mode could yield an upper dir the guest can't
+// traverse.
+func (g *FSGate) CopyUp(guestPath string) (string, error) {
+	if g.policy.UpperDir == "" {
+		return "", ErrNoUpperLayer
+	}
+	if !filepath.IsAbs(guestPath) {
+		return "", fmt.Errorf("%w: copy-up needs absolute path: %q",
+			ErrEscape, guestPath)
+	}
+	clean := filepath.Clean(guestPath)
+	upperPath := filepath.Join(g.policy.UpperDir, clean)
+
+	g.copyUpMu.Lock()
+	defer g.copyUpMu.Unlock()
+
+	if info, err := os.Lstat(upperPath); err == nil {
+		if isWhiteout(info) {
+			return "", fmt.Errorf("%w: cannot copy over whiteout: %q",
+				ErrWhiteout, guestPath)
+		}
+		return upperPath, nil
+	}
+
+	if g.policy.LowerDir == "" {
+		return "", fmt.Errorf("gate: no lower layer to copy from: %q", guestPath)
+	}
+	lowerPath := filepath.Join(g.policy.LowerDir, clean)
+	srcInfo, err := os.Lstat(lowerPath)
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(upperPath), 0o755); err != nil {
+		return "", err
+	}
+
+	switch {
+	case srcInfo.Mode()&os.ModeSymlink != 0:
+		target, err := os.Readlink(lowerPath)
+		if err != nil {
+			return "", err
+		}
+		if err := os.Symlink(target, upperPath); err != nil {
+			return "", err
+		}
+	case srcInfo.Mode().IsRegular():
+		if err := copyRegularFile(lowerPath, upperPath, srcInfo.Mode().Perm()); err != nil {
+			return "", err
+		}
+	default:
+		return "", fmt.Errorf("gate: copy-up unsupported for %q (mode %v)",
+			guestPath, srcInfo.Mode())
+	}
+
+	return upperPath, nil
+}
+
+// copyRegularFile streams src to dst with O_EXCL to refuse clobbering
+// an existing upper file. The caller's copyUpMu serialises callers,
+// but O_EXCL guards against a racing host-side create we did not
+// expect.
+func copyRegularFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
 
 // isWhiteout reports whether info represents an overlay whiteout

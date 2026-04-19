@@ -281,26 +281,32 @@ func handleOpenAt(d *Dispatcher, regs *Regs) Verdict {
 
 	writable := flags&openWritableMask != 0
 	if writable && layer == LayerLower {
-		// Two sub-cases:
-		//   (a) File exists on lower -> real copy-up is needed
-		//       before we can write. Not yet implemented; surface
-		//       EROFS so callers notice loudly.
-		//   (b) File is missing from lower AND O_CREAT AND Upper is
-		//       configured -> redirect the create to the upper
-		//       layer so it's born writable. Parent directory
-		//       creation on upper isn't attempted here; for nested
-		//       paths callers must mkdirat first.
-		if flags&syscall.O_CREAT != 0 && d.FS.policy.UpperDir != "" {
-			if _, statErr := os.Lstat(hostPath); os.IsNotExist(statErr) {
-				hostPath = filepath.Join(d.FS.policy.UpperDir, absGuest)
-			} else {
-				regs.X[0] = EncodeErrno(syscall.EROFS)
-				return VerdictHandled
-			}
-		} else {
+		// Without an UpperDir the overlay is truly read-only; there's
+		// nowhere to put the writable copy.
+		if d.FS.policy.UpperDir == "" {
 			regs.X[0] = EncodeErrno(syscall.EROFS)
 			return VerdictHandled
 		}
+		switch _, statErr := os.Lstat(hostPath); {
+		case statErr == nil:
+			// File exists on lower — promote it to upper before the
+			// kernel open touches it, so the write lands on upper.
+			upperPath, err := d.FS.CopyUp(absGuest)
+			if err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+			hostPath = upperPath
+		case os.IsNotExist(statErr) && flags&syscall.O_CREAT != 0:
+			// Fresh create: point directly at the upper layer.
+			// Parent directories must already exist on upper (callers
+			// mkdirat first); we don't implicit-MkdirAll because that
+			// would hide guest path bugs.
+			hostPath = filepath.Join(d.FS.policy.UpperDir, absGuest)
+		}
+		// Any other stat error (EACCES etc.) falls through to the
+		// kernel open below with the lower path — it will surface
+		// the same errno naturally.
 	}
 
 	hostFd, err := syscall.Open(hostPath, flags, mode)

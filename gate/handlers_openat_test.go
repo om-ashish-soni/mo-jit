@@ -83,6 +83,71 @@ func TestOpenAtWritableLowerReturnsEROFS(t *testing.T) {
 	expectErrno(t, r, syscall.EROFS)
 }
 
+func TestOpenAtWritableLowerCopiesUp(t *testing.T) {
+	// With UpperDir configured, a writable open on a lower-only file
+	// must trigger copy-up: the open succeeds against a fresh upper
+	// copy, subsequent writes hit upper, and the lower backing is
+	// left untouched.
+	h := newOpenAtHarness(t, true)
+	lowerFile := filepath.Join(h.lower, "etc/config")
+	mustMkdirAll(t, filepath.Join(h.lower, "etc"))
+	if err := os.WriteFile(lowerFile, []byte("orig"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	r := h.open(0x5020, "/etc/config", int64(atFDCWD), syscall.O_WRONLY, 0)
+	guestFd := int64(r.X[0])
+	if guestFd < 0 {
+		t.Fatalf("writable lower with UpperDir: X[0]=%d (%s)",
+			guestFd, syscall.Errno(-guestFd))
+	}
+
+	// Upper copy must exist with the original content and mode.
+	upperFile := filepath.Join(h.upper, "etc/config")
+	got, err := os.ReadFile(upperFile)
+	if err != nil {
+		t.Fatalf("upper copy missing after open: %v", err)
+	}
+	if string(got) != "orig" {
+		t.Errorf("upper content after copy-up = %q, want orig", got)
+	}
+
+	// Write through the returned fd and verify it lands on upper,
+	// not lower.
+	mr := &FakeMemReader{}
+	mr.Stage(0xc000, []byte("mutated"))
+	h.d.MemR = mr
+	w := &Regs{NR: SysWrite}
+	w.X[0] = uint64(guestFd)
+	w.X[1] = 0xc000
+	w.X[2] = 7
+	h.d.Dispatch(w)
+	if int64(w.X[0]) != 7 {
+		t.Fatalf("write through copied-up fd: X[0]=%d", int64(w.X[0]))
+	}
+
+	cr := &Regs{NR: SysClose}
+	cr.X[0] = uint64(guestFd)
+	h.d.Dispatch(cr)
+
+	// Upper now holds the mutation; lower is still the pristine
+	// backing. This is the whole point of copy-up.
+	upperAfter, err := os.ReadFile(upperFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(upperAfter) != "mutated" {
+		t.Errorf("upper after write = %q, want mutated", upperAfter)
+	}
+	lowerAfter, err := os.ReadFile(lowerFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lowerAfter) != "orig" {
+		t.Errorf("lower mutated after copy-up write: %q", lowerAfter)
+	}
+}
+
 func TestOpenAtWritableUpperSucceeds(t *testing.T) {
 	h := newOpenAtHarness(t, true)
 	mustTouch(t, filepath.Join(h.upper, "file.txt"))
