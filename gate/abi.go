@@ -99,6 +99,8 @@ const (
 	SysChDir      uint64 = 49
 	SysFChMod     uint64 = 52
 	SysFChModAt   uint64 = 53
+	SysFChOwnAt   uint64 = 54
+	SysFChOwn     uint64 = 55
 	SysOpenAt     uint64 = 56
 	SysClose      uint64 = 57
 	SysPipe2      uint64 = 59

@@ -1740,6 +1740,92 @@ func handleFChModAt(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleFChOwn services fchown(fd, uid, gid) (NR=55). Pure host-fd
+// passthrough for the same reason fchmod is: the copy-up happened at
+// open time, so we already have a host fd pointing at the layer the
+// guest is allowed to mutate.
+//
+// Unrooted Android lacks CAP_CHOWN, so the kernel will typically EPERM
+// anything other than a no-op (same-owner) chown. We still route it
+// rather than passthrough so the host's real /etc/* never gets touched.
+func handleFChOwn(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	uid := int(int32(regs.X[1]))
+	gid := int(int32(regs.X[2]))
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Fchown(hostFd, uid, gid); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFChOwnAt services fchownat(dirfd, path, uid, gid, flags) (NR=54).
+// aarch64 layout: x0=dirfd, x1=path, x2=uid, x3=gid, x4=flags.
+//
+// Same overlay shape as fchmodat: resolve the guest path, copy-up if
+// it's lower-only, then forward to the kernel. AT_SYMLINK_NOFOLLOW is
+// honoured (unlike fchmodat where chmod-on-symlink is universally
+// ENOTSUP): chown(2) on a symlink changes the link's owner, and the
+// kernel handles that distinction via the flag.
+//
+// uid/gid come in as 32-bit unsigned values; -1 (0xffffffff) means
+// "don't change", and we forward that through as int(-1) so syscall.
+// Fchownat sees the same sentinel the kernel expects.
+func handleFChOwnAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	uid := int(int32(regs.X[2]))
+	gid := int(int32(regs.X[3]))
+	flags := int(regs.X[4])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest, ok := absolutiseAt(d, dirfd, path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+	if err := syscall.Fchownat(atFDCWD, hostPath, uid, gid, flags); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // utimeNow is the magic tv_nsec value that tells utimensat "use the
 // current time for this field" (include/uapi/linux/stat.h — UTIME_NOW).
 const utimeNow = ((1 << 30) - 1)
