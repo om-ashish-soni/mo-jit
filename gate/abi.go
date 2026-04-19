@@ -128,6 +128,7 @@ const (
 	// Network syscalls.
 	SysSocket      uint64 = 198
 	SysBind        uint64 = 200
+	SysListen      uint64 = 201
 	SysAccept      uint64 = 202
 	SysConnect     uint64 = 203
 	SysGetSockName uint64 = 204

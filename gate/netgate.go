@@ -62,6 +62,32 @@ func (n *NetGate) CheckConnect(addr netip.AddrPort) error {
 	}
 }
 
+// CheckAccept is the policy gate for accept/accept4. Same rule as
+// CheckConnect on the peer: loopback-only requires the incoming peer
+// to be loopback (otherwise the guest is reachable from outside the
+// local host via whatever bind the kernel routed), internet allows
+// any, none rejects.
+//
+// In practice bind(2) + CheckBind already restrict the listen surface
+// to loopback on loopback-only, so this is largely a belt-and-braces
+// check. The cost is one call per accept, negligible next to the
+// round-trip itself.
+func (n *NetGate) CheckAccept(peer netip.AddrPort) error {
+	switch n.policy.Mode {
+	case "none", "":
+		return ErrBlockedByPolicy
+	case "loopback-only":
+		if peer.Addr().IsLoopback() {
+			return nil
+		}
+		return ErrBlockedByPolicy
+	case "internet":
+		return nil
+	default:
+		return errors.New("gate: unknown NetPolicy.Mode (want none|loopback-only|internet)")
+	}
+}
+
 // CheckBind is the policy gate for bind(2). Connect and sendto gate
 // the *destination*; bind gates the *local source* address. For a
 // loopback-only guest, a bind to a public interface would expose the

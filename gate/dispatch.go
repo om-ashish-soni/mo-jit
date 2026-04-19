@@ -205,6 +205,9 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysSocket] = handleSocket
 	d.handlers[SysConnect] = handleConnect
 	d.handlers[SysBind] = handleBind
+	d.handlers[SysListen] = handleListen
+	d.handlers[SysAccept] = handleAccept
+	d.handlers[SysAccept4] = handleAccept4
 	d.handlers[SysSendTo] = handleSendTo
 	d.handlers[SysRecvFrom] = handleRecvFrom
 	d.handlers[SysGetSockName] = handleGetSockName

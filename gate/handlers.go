@@ -2942,6 +2942,131 @@ func encodeSockaddr(sa syscall.Sockaddr) ([]byte, error) {
 	}
 }
 
+// handleListen services listen(sockfd, backlog) (NR=201). No policy:
+// turning a bound socket into a passive listener isn't a destination
+// decision — bind already vetted the local address. Pass through to
+// the kernel, which may itself cap backlog at SOMAXCONN.
+func handleListen(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	backlog := int(regs.X[1])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Listen(hostFd, backlog); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleAccept services accept(sockfd, addr, addrlen) (NR=202) — the
+// legacy shape that doesn't take flags. Forwarded to handleAccept4
+// with flags=0.
+func handleAccept(d *Dispatcher, regs *Regs) Verdict {
+	return acceptCommon(d, regs, 0)
+}
+
+// handleAccept4 services accept4(sockfd, addr, addrlen, flags)
+// (NR=242). flags carry SOCK_NONBLOCK and SOCK_CLOEXEC in the same
+// encoding as socket(2) — forwarded to the kernel call.
+func handleAccept4(d *Dispatcher, regs *Regs) Verdict {
+	return acceptCommon(d, regs, int(regs.X[3]))
+}
+
+// acceptCommon is the shared body for accept / accept4. It resolves
+// the listening fd, pulls the next incoming peer from the host
+// kernel, enforces NetGate.CheckAccept on the peer's address, encodes
+// the peer's sockaddr back into the guest's (addr, *addrlen) out-
+// params, and registers the new fd in the guest's FDTable.
+//
+// Policy violation on the peer closes the accepted host fd before
+// returning EACCES — we never hand the guest an fd that wasn't
+// policy-approved, and we don't leave a dangling half-open
+// connection in the kernel either.
+func acceptCommon(d *Dispatcher, regs *Regs, flags int) Verdict {
+	guestFd := int(regs.X[0])
+	addrPtr := regs.X[1]
+	addrLenPtr := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	newFd, peer, err := syscall.Accept4(hostFd, flags)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	// Peer policy check. If CheckAccept denies, close the accepted fd
+	// and surface EACCES — the guest never learns the fd existed.
+	if ap, ok := sockaddrToAddrPort(peer); ok {
+		if err := d.Net.CheckAccept(ap); err != nil {
+			_ = syscall.Close(newFd)
+			regs.X[0] = EncodeErrno(syscall.EACCES)
+			return VerdictHandled
+		}
+	}
+
+	if addrPtr != 0 {
+		saBytes, encErr := encodeSockaddr(peer)
+		if encErr == nil {
+			avail := len(saBytes)
+			if addrLenPtr != 0 {
+				lb, lerr := d.MemR.ReadBytes(addrLenPtr, 4)
+				if lerr != nil {
+					_ = syscall.Close(newFd)
+					regs.X[0] = EncodeErrno(lerr)
+					return VerdictHandled
+				}
+				glen := int(binary.LittleEndian.Uint32(lb))
+				if glen < avail {
+					avail = glen
+				}
+			}
+			if avail > 0 {
+				if err := d.Mem.WriteBytes(addrPtr, saBytes[:avail]); err != nil {
+					_ = syscall.Close(newFd)
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+			if addrLenPtr != 0 {
+				var lb [4]byte
+				binary.LittleEndian.PutUint32(lb[:], uint32(len(saBytes)))
+				if err := d.Mem.WriteBytes(addrLenPtr, lb[:]); err != nil {
+					_ = syscall.Close(newFd)
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+		}
+	}
+
+	regs.X[0] = uint64(d.FDs.Allocate(newFd))
+	return VerdictHandled
+}
+
+// sockaddrToAddrPort pulls a netip.AddrPort out of a kernel-returned
+// Sockaddr for the two families we gate (AF_INET, AF_INET6). Returns
+// ok=false for anything else — callers treat that as "no policy
+// applies" (AF_UNIX peers on an accept are filesystem, not network).
+func sockaddrToAddrPort(sa syscall.Sockaddr) (netip.AddrPort, bool) {
+	switch s := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return netip.AddrPortFrom(netip.AddrFrom4(s.Addr), uint16(s.Port)), true
+	case *syscall.SockaddrInet6:
+		return netip.AddrPortFrom(netip.AddrFrom16(s.Addr), uint16(s.Port)), true
+	default:
+		return netip.AddrPort{}, false
+	}
+}
+
 // handleGetSockName services getsockname(sockfd, addr, addrlen)
 // (NR=204) and its sibling handleGetPeerName handles getpeername
 // (NR=205). Both read *addrlen from guest memory, ask the kernel for
