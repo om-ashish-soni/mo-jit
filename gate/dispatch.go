@@ -132,4 +132,5 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysFStat] = handleFStat
 	d.handlers[SysMkdirAt] = handleMkdirAt
 	d.handlers[SysSymlinkAt] = handleSymlinkAt
+	d.handlers[SysUnlinkAt] = handleUnlinkAt
 }

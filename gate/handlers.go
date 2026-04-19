@@ -2,6 +2,7 @@ package gate
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -482,6 +483,184 @@ func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
 	}
 	regs.X[0] = 0
 	return VerdictHandled
+}
+
+// atRemoveDir mirrors Linux's AT_REMOVEDIR flag: when set on
+// unlinkat, the syscall behaves like rmdir(2) instead of unlink(2).
+const atRemoveDir = 0x200
+
+// handleUnlinkAt services unlinkat(dirfd, pathname, flags) (NR=35).
+//
+// aarch64 layout:
+//
+//	x0 = dirfd, x1 = pathname, x2 = flags (AT_REMOVEDIR)
+//
+// Three layer cases to cover, derived from overlay semantics:
+//
+//  1. Upper has the target, lower doesn't: os.Remove it, no whiteout
+//     needed — the path is gone from both layers.
+//  2. Upper has the target AND lower has the path: os.Remove upper,
+//     then write a whiteout so the lower entry stays hidden.
+//  3. Upper is missing but lower has the path: write a whiteout.
+//     Lower stays untouched (it's meant to be immutable anyway, and
+//     even if we wanted to delete from it we lack permission on most
+//     deployments — the shared base image is typically read-only).
+//
+// AT_REMOVEDIR swaps unlink(2) semantics for rmdir(2): EISDIR becomes
+// "this is NOT a dir", ENOTDIR becomes the wrong-shape error, and
+// ENOTEMPTY is surfaced when children exist on either layer.
+//
+// The emptiness check for AT_REMOVEDIR of a lower-only directory
+// walks the lower dir and subtracts any path covered by a whiteout
+// or real entry on upper — without this, a dir the guest sees as
+// empty (because upper whites out its last child) would still appear
+// non-empty to rmdir. For now we approximate: we require lower to be
+// empty ignoring upper masking. A later pass with getdents-level
+// overlay merging will tighten this up.
+func handleUnlinkAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	flags := int(regs.X[2])
+	removeDir := flags&atRemoveDir != 0
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	var absGuest string
+	switch {
+	case filepath.IsAbs(path):
+		absGuest = filepath.Clean(path)
+	case dirfd == int64(atFDCWD):
+		absGuest = d.FS.AbsFromGuest(path)
+	default:
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	if absGuest == "/" {
+		// You can't unlink the root. Kernel: unlink → EISDIR,
+		// rmdir → EBUSY. We stick with kernel behaviour.
+		if removeDir {
+			regs.X[0] = EncodeErrno(syscall.EBUSY)
+		} else {
+			regs.X[0] = EncodeErrno(syscall.EISDIR)
+		}
+		return VerdictHandled
+	}
+
+	upperPath := filepath.Join(d.FS.policy.UpperDir, absGuest)
+	lowerPath := ""
+	if d.FS.policy.LowerDir != "" {
+		lowerPath = filepath.Join(d.FS.policy.LowerDir, absGuest)
+	}
+
+	upperInfo, upperErr := os.Lstat(upperPath)
+	upperIsWhiteout := upperErr == nil && isWhiteoutPath(upperPath, upperInfo)
+	upperPresent := upperErr == nil && !upperIsWhiteout
+
+	var lowerInfo os.FileInfo
+	lowerPresent := false
+	if lowerPath != "" {
+		if li, err := os.Lstat(lowerPath); err == nil {
+			lowerInfo = li
+			lowerPresent = true
+		}
+	}
+
+	// Missing everywhere (including "upper has a whiteout and lower
+	// doesn't back it") is just ENOENT.
+	if !upperPresent && !lowerPresent {
+		regs.X[0] = EncodeErrno(syscall.ENOENT)
+		return VerdictHandled
+	}
+
+	// Determine effective type for the kind-check. Upper wins when
+	// present, falling back to lower.
+	var effective os.FileInfo
+	switch {
+	case upperPresent:
+		effective = upperInfo
+	default:
+		effective = lowerInfo
+	}
+
+	if removeDir {
+		if !effective.IsDir() {
+			regs.X[0] = EncodeErrno(syscall.ENOTDIR)
+			return VerdictHandled
+		}
+		if lowerPresent && lowerInfo.IsDir() {
+			empty, err := lowerDirEmpty(lowerPath)
+			if err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+			if !empty {
+				regs.X[0] = EncodeErrno(syscall.ENOTEMPTY)
+				return VerdictHandled
+			}
+		}
+	} else if effective.IsDir() {
+		regs.X[0] = EncodeErrno(syscall.EISDIR)
+		return VerdictHandled
+	}
+
+	// Remove upper (if a real entry — not a whiteout). Rmdir shape
+	// is handled by os.Remove matching the underlying inode type.
+	if upperPresent {
+		if err := os.Remove(upperPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	} else if upperIsWhiteout {
+		// Already hidden — this shouldn't happen because we
+		// treated upperIsWhiteout as !upperPresent above and
+		// returned ENOENT when lower was also absent. Guard
+		// anyway in case lower comes back into play under a race.
+		regs.X[0] = EncodeErrno(syscall.ENOENT)
+		return VerdictHandled
+	}
+
+	if lowerPresent {
+		if err := os.MkdirAll(filepath.Dir(upperPath), 0o755); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		if err := writeWhiteout(upperPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// lowerDirEmpty reports whether a lower-layer directory has no
+// children. Reads one entry; O(1) for non-empty dirs. Readdirnames
+// returns io.EOF on a truly empty dir, any other error is surfaced.
+func lowerDirEmpty(path string) (bool, error) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer dir.Close()
+	names, err := dir.Readdirnames(1)
+	if errors.Is(err, io.EOF) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(names) == 0, nil
 }
 
 // handleSymlinkAt services symlinkat(target, newdirfd, linkpath) (NR=36).

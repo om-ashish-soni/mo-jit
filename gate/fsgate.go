@@ -162,7 +162,7 @@ func (g *FSGate) Resolve(guestPath string) (string, Layer, error) {
 	if g.policy.UpperDir != "" {
 		upperHost := filepath.Join(g.policy.UpperDir, clean)
 		if info, err := os.Lstat(upperHost); err == nil {
-			if isWhiteout(info) {
+			if isWhiteoutPath(upperHost, info) {
 				return "", LayerNone, ErrWhiteout
 			}
 			return upperHost, LayerUpper, nil
@@ -263,7 +263,7 @@ func (g *FSGate) CopyUp(guestPath string) (string, error) {
 	defer g.copyUpMu.Unlock()
 
 	if info, err := os.Lstat(upperPath); err == nil {
-		if isWhiteout(info) {
+		if isWhiteoutPath(upperPath, info) {
 			return "", fmt.Errorf("%w: cannot copy over whiteout: %q",
 				ErrWhiteout, guestPath)
 		}
@@ -327,11 +327,19 @@ func copyRegularFile(src, dst string, perm os.FileMode) error {
 	return out.Close()
 }
 
-// isWhiteout reports whether info represents an overlay whiteout
-// (character device with rdev 0:0). Matches fuse-overlayfs semantics.
-// The caller has already stat'd; isWhiteout never touches the FS.
+// whiteoutXattr is the name of the xattr fuse-overlayfs stamps on a
+// placeholder file to mark it as a whiteout. We use it as the
+// fallback form whenever the preferred char-device-with-rdev-0
+// format is unavailable because CAP_MKNOD is missing — which is the
+// permanent case for untrusted_app on 2026 GKI kernels.
+const whiteoutXattr = "user.overlay.whiteout"
+
+// isWhiteout reports whether info alone unambiguously represents an
+// overlay whiteout. Today that means the classic char-device-with-rdev-0
+// form; the xattr form is detected via isWhiteoutPath, which also needs
+// the host path to query the xattr.
 func isWhiteout(info os.FileInfo) bool {
-	if info.Mode()&os.ModeCharDevice == 0 {
+	if info == nil || info.Mode()&os.ModeCharDevice == 0 {
 		return false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -339,4 +347,49 @@ func isWhiteout(info os.FileInfo) bool {
 		return false
 	}
 	return stat.Rdev == 0
+}
+
+// isWhiteoutPath is isWhiteout augmented with the xattr fallback: a
+// size-zero regular file stamped with user.overlay.whiteout is also
+// a whiteout. Size-zero regulars are rare on a working upper layer
+// (a real touched file is immediately populated) so the extra
+// Getxattr on the hot path is negligible.
+func isWhiteoutPath(path string, info os.FileInfo) bool {
+	if isWhiteout(info) {
+		return true
+	}
+	if info == nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		return false
+	}
+	buf := make([]byte, 1)
+	_, err := syscall.Getxattr(path, whiteoutXattr, buf)
+	return err == nil
+}
+
+// writeWhiteout marks path as a deleted overlay entry. Prefers the
+// char-device-with-rdev-0 form (CAP_MKNOD required); falls back to a
+// regular file tagged with user.overlay.whiteout when mknod is
+// rejected by the kernel. The dual format means mo-jit works both in
+// privileged CI runners and on unrooted Android where CAP_MKNOD is
+// never granted to application code.
+//
+// The parent directory must already exist; the caller is responsible
+// for MkdirAll (mirroring what os.Remove would require).
+func writeWhiteout(path string) error {
+	if err := syscall.Mknod(path, syscall.S_IFCHR|0o600, 0); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EACCES) &&
+		!errors.Is(err, syscall.ENOSYS) {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	if err := syscall.Setxattr(path, whiteoutXattr, []byte{'y'}, 0); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
