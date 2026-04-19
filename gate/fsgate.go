@@ -2,12 +2,44 @@ package gate
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 )
 
-// ErrEscape is returned when a guest path resolves outside the configured
-// rootfs, upper layer, and bind-mount set.
+// ErrEscape is returned when a guest path cannot be contained within
+// the configured rootfs, upper layer, and bind-mount set.
 var ErrEscape = errors.New("gate: path escape blocked")
+
+// ErrWhiteout is returned when the upper layer marks a path as
+// deleted. Callers must surface this to the guest as -ENOENT and
+// must NOT fall through to the lower layer.
+var ErrWhiteout = errors.New("gate: path marked deleted (whiteout)")
+
+// Layer identifies which storage layer satisfied a path resolution.
+type Layer int
+
+const (
+	LayerNone  Layer = 0
+	LayerBind  Layer = 1
+	LayerUpper Layer = 2
+	LayerLower Layer = 3
+)
+
+func (l Layer) String() string {
+	switch l {
+	case LayerBind:
+		return "bind"
+	case LayerUpper:
+		return "upper"
+	case LayerLower:
+		return "lower"
+	default:
+		return "none"
+	}
+}
 
 // FSGate enforces filesystem virtualization for a Policy.
 //
@@ -16,9 +48,12 @@ var ErrEscape = errors.New("gate: path escape blocked")
 //   - / is the merged view of LowerDir (read-only) and UpperDir (writable).
 //   - Reads walk UpperDir first, then LowerDir.
 //   - Writes copy-up from LowerDir to UpperDir on first touch, then
-//     proceed against UpperDir.
-//   - Deletes record whiteouts in UpperDir (opaque character devices
-//     with major=0 minor=0, matching fuse-overlayfs semantics).
+//     proceed against UpperDir. (Copy-up lands in M2 alongside
+//     ResolveForWrite.)
+//   - Deletes record whiteouts in UpperDir (character devices with
+//     major=0 minor=0, matching fuse-overlayfs semantics). A whiteout
+//     hides the corresponding lower entry — callers receive ErrWhiteout
+//     and must translate to -ENOENT.
 //
 // This is an OCI-style overlay implemented entirely in userspace. We do
 // not use kernel overlayfs: it is unavailable without CONFIG_USER_NS,
@@ -34,21 +69,102 @@ func NewFSGate(p Policy) *FSGate {
 	return &FSGate{policy: p}
 }
 
-// Resolve translates a guest absolute path to the host-side path the
-// kernel should actually see. Returns ErrEscape if the path cannot be
-// contained within LowerDir, UpperDir, or one of the bind mounts.
+// Resolve translates an absolute guest path to the host-side path the
+// kernel should operate on, plus the layer that satisfied the lookup.
 //
-// TODO(M2): real implementation. Current stub resolves only the trivial
-// "guest path lives under LowerDir, no bind mounts, no upper layer"
-// case. It is NOT safe for production use and exists so that downstream
-// consumers (cmd/mojit-run, gate_test.go, mo-code's adapter) can import
-// the package and validate their wiring against a stable API.
-func (g *FSGate) Resolve(guestPath string) (hostPath string, err error) {
+// Resolution order:
+//  1. Bind mounts (longest guest-prefix match wins).
+//  2. UpperDir (writable overlay). A whiteout entry returns ErrWhiteout.
+//  3. LowerDir (read-only base).
+//
+// A relative guest path is rejected with ErrEscape: the ELF loader
+// always supplies absolute paths, and accepting anything else would
+// silently let a clever guest translate relative to the real host cwd.
+//
+// Note on `..`: filepath.Clean neutralises `..` at root (`/../foo` →
+// `/foo`), so bind-mount `..`-traversal cannot escape a bind's
+// HostPath at the path layer. Symlink-based escape inside a bind's
+// HostPath is NOT yet mitigated — that requires openat2
+// RESOLVE_IN_ROOT, tracked for M2's ResolveForOpen path.
+func (g *FSGate) Resolve(guestPath string) (string, Layer, error) {
 	if !filepath.IsAbs(guestPath) {
-		return "", errors.New("gate: guest path must be absolute")
+		return "", LayerNone, fmt.Errorf("%w: guest path must be absolute: %q",
+			ErrEscape, guestPath)
 	}
 	clean := filepath.Clean(guestPath)
-	// TODO(M2): walk upper/ then lower/; handle bind mounts; handle
-	// whiteouts; reject escapes via ".." / symlinks / TOCTOU.
-	return filepath.Join(g.policy.LowerDir, clean), nil
+
+	if host, ok := g.matchBind(clean); ok {
+		return host, LayerBind, nil
+	}
+
+	if g.policy.UpperDir != "" {
+		upperHost := filepath.Join(g.policy.UpperDir, clean)
+		if info, err := os.Lstat(upperHost); err == nil {
+			if isWhiteout(info) {
+				return "", LayerNone, ErrWhiteout
+			}
+			return upperHost, LayerUpper, nil
+		}
+	}
+
+	if g.policy.LowerDir == "" {
+		return "", LayerNone, errors.New("gate: no lower layer configured")
+	}
+	return filepath.Join(g.policy.LowerDir, clean), LayerLower, nil
+}
+
+// matchBind returns (hostPath, true) if cleanGuestPath falls inside any
+// configured bind mount. Longest guest-prefix match wins so that
+// nested binds resolve correctly — e.g. /work bound to /host/proj and
+// /work/vendor bound to /host/vendor both active; /work/vendor/pkg.go
+// resolves via the vendor bind.
+func (g *FSGate) matchBind(cleanGuestPath string) (string, bool) {
+	bestLen := -1
+	var bestHost string
+
+	for _, b := range g.policy.Binds {
+		if b.GuestPath == "" || !filepath.IsAbs(b.GuestPath) {
+			continue
+		}
+		bGuest := filepath.Clean(b.GuestPath)
+		var sub string
+		matched := false
+		switch {
+		case cleanGuestPath == bGuest:
+			matched = true
+		case bGuest == "/":
+			// Root bind: everything under / matches; sub is the
+			// whole path including the leading slash stripped.
+			sub = strings.TrimPrefix(cleanGuestPath, "/")
+			matched = true
+		case strings.HasPrefix(cleanGuestPath, bGuest+"/"):
+			sub = strings.TrimPrefix(cleanGuestPath, bGuest)
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+		if len(bGuest) > bestLen {
+			bestLen = len(bGuest)
+			bestHost = filepath.Join(b.HostPath, sub)
+		}
+	}
+	if bestLen < 0 {
+		return "", false
+	}
+	return bestHost, true
+}
+
+// isWhiteout reports whether info represents an overlay whiteout
+// (character device with rdev 0:0). Matches fuse-overlayfs semantics.
+// The caller has already stat'd; isWhiteout never touches the FS.
+func isWhiteout(info os.FileInfo) bool {
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return stat.Rdev == 0
 }
