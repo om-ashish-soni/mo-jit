@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"unsafe"
 )
 
 // atFDCWD mirrors Linux's AT_FDCWD (-100 on every arch), the magic
@@ -1369,6 +1370,163 @@ func handleLSeek(d *Dispatcher, regs *Regs) Verdict {
 	}
 	regs.X[0] = uint64(off)
 	return VerdictHandled
+}
+
+// Linux linkat(2) flags the handler understands.
+const (
+	atSymlinkFollow = 0x400  // AT_SYMLINK_FOLLOW — follow a symlink at oldpath
+	atEmptyPathFlag = 0x1000 // AT_EMPTY_PATH — oldpath=="" means "the file behind olddirfd"
+)
+
+// handleLinkAt services linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+// (NR=37). apt/dpkg pre-stage packages by hardlinking payloads out of
+// a cache dir, and `cp -l` / git's object dedup rely on the same
+// primitive — low-traffic but essential for "install a .deb" paths.
+//
+// aarch64 layout:
+//
+//	x0 = olddirfd, x1 = oldpath,
+//	x2 = newdirfd, x3 = newpath, x4 = flags
+//
+// Layer handling:
+//   - src on upper: os.Link upper-src → upper-dst. Same-layer,
+//     atomic, shares inode.
+//   - src on lower only: copy-up first, then link. Promotes src to
+//     upper so both paths share an upper-layer inode. This breaks
+//     "nlink across the copy-up boundary" but preserves "both paths
+//     see the same bytes", which is what hardlink consumers
+//     actually depend on in practice (apt, git, cp -l).
+//
+// Flags:
+//   - AT_SYMLINK_FOLLOW is honoured via syscall.Linkat's flags arg.
+//   - AT_EMPTY_PATH returns ENOSYS until dirfd-relative lookups are
+//     wired (same as every other *at handler in M2).
+//
+// Unsupported shapes return ENOSYS so guest failures point us at the
+// exact missing case.
+func handleLinkAt(d *Dispatcher, regs *Regs) Verdict {
+	oldDirfd := int64(regs.X[0])
+	oldPtr := regs.X[1]
+	newDirfd := int64(regs.X[2])
+	newPtr := regs.X[3]
+	flags := int(regs.X[4])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+	if flags&atEmptyPathFlag != 0 {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	oldPath, err := d.Paths.ReadPath(oldPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	newPath, err := d.Paths.ReadPath(newPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	oldAbs, ok := absolutiseAt(d, oldDirfd, oldPath)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	newAbs, ok := absolutiseAt(d, newDirfd, newPath)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	upperDir := d.FS.policy.UpperDir
+	newUpper := filepath.Join(upperDir, newAbs)
+
+	// Dst must not exist (upper non-whiteout OR lower-not-masked).
+	if info, err := os.Lstat(newUpper); err == nil {
+		if !isWhiteoutPath(newUpper, info) {
+			regs.X[0] = EncodeErrno(syscall.EEXIST)
+			return VerdictHandled
+		}
+		// Whiteout at dst — clear so Linkat doesn't trip on it.
+		if err := os.Remove(newUpper); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	} else if d.FS.policy.LowerDir != "" {
+		lowerNew := filepath.Join(d.FS.policy.LowerDir, newAbs)
+		if _, err := os.Lstat(lowerNew); err == nil {
+			regs.X[0] = EncodeErrno(syscall.EEXIST)
+			return VerdictHandled
+		}
+	}
+
+	// Locate src host path, promoting lower→upper via copy-up so the
+	// hardlink lands within a single filesystem.
+	hostOld, layer, err := d.FS.Resolve(oldAbs)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		// Require the lower-side entry to actually exist before we
+		// copy-up — Resolve can return nil for a lower path that has
+		// never been statted.
+		if _, err := os.Lstat(hostOld); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperSrc, err := d.FS.CopyUp(oldAbs)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostOld = upperSrc
+	}
+
+	if err := os.MkdirAll(filepath.Dir(newUpper), 0o755); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if err := linkatHost(hostOld, newUpper, flags&atSymlinkFollow); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// linkatHost invokes the raw linkat(2) syscall against the host with
+// AT_FDCWD on both sides. Go's syscall package exposes SYS_LINKAT but
+// not a typed Linkat wrapper on linux/arm64, so we drop to Syscall6.
+// flags is passed through verbatim (AT_SYMLINK_FOLLOW — AT_EMPTY_PATH
+// is filtered upstream since it implies dirfd-relative resolution).
+func linkatHost(oldPath, newPath string, flags int) error {
+	oldP, err := syscall.BytePtrFromString(oldPath)
+	if err != nil {
+		return err
+	}
+	newP, err := syscall.BytePtrFromString(newPath)
+	if err != nil {
+		return err
+	}
+	fd := atFDCWD // local int so uintptr sign-extends, not overflows
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_LINKAT,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(oldP)),
+		uintptr(fd),
+		uintptr(unsafe.Pointer(newP)),
+		uintptr(flags),
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // handleClose services close(fd) (NR=57).
