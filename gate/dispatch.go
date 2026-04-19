@@ -129,6 +129,7 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysDup] = handleDup
 	d.handlers[SysDup3] = handleDup3
 	d.handlers[SysFCntl] = handleFcntl
+	d.handlers[SysPipe2] = handlePipe2
 	d.handlers[SysRead] = handleRead
 	d.handlers[SysWrite] = handleWrite
 	d.handlers[SysNewFStatAt] = handleNewFStatAt

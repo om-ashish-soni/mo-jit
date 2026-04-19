@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -1283,6 +1284,63 @@ func handleFcntl(d *Dispatcher, regs *Regs) Verdict {
 		regs.X[0] = EncodeErrno(syscall.ENOSYS)
 		return VerdictHandled
 	}
+}
+
+// pipe2AcceptedFlags is the set of flag bits Linux pipe2(2) accepts:
+// O_CLOEXEC applies CLOEXEC to both new fds, O_NONBLOCK puts the fds
+// in non-blocking mode, O_DIRECT switches the pipe to packet mode
+// (rare, but well-defined). Any other bit is EINVAL.
+const pipe2AcceptedFlags = syscall.O_CLOEXEC | syscall.O_NONBLOCK | syscall.O_DIRECT
+
+// handlePipe2 services pipe2(pipefd, flags) (NR=59). pipe(2) doesn't
+// exist on aarch64 — the generic syscall table only exposes pipe2.
+//
+// aarch64 layout: x0 = pipefd (int[2] out), x1 = flags.
+//
+// Writes two guest fds (4 bytes each, little-endian) into the caller's
+// pipefd buffer: [0] = read end, [1] = write end. Host-side pipe is a
+// real kernel pipe — the gate owns both ends through the FDTable, and
+// reads/writes flow through handleRead/handleWrite like any other fd.
+//
+// If Pipe2 succeeds but the guest buffer write fails, we tear both
+// fds down on the host AND in the guest table so the caller doesn't
+// end up with two ghost fds the gate thinks are open but the guest
+// has no names for.
+func handlePipe2(d *Dispatcher, regs *Regs) Verdict {
+	bufPtr := regs.X[0]
+	flags := int(regs.X[1])
+
+	if flags & ^pipe2AcceptedFlags != 0 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	if bufPtr == 0 {
+		regs.X[0] = EncodeErrno(syscall.EFAULT)
+		return VerdictHandled
+	}
+
+	var fds [2]int
+	if err := syscall.Pipe2(fds[:], flags); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	gR := d.FDs.Allocate(fds[0])
+	gW := d.FDs.Allocate(fds[1])
+
+	out := make([]byte, 8)
+	binary.LittleEndian.PutUint32(out[0:4], uint32(gR))
+	binary.LittleEndian.PutUint32(out[4:8], uint32(gW))
+	if err := d.Mem.WriteBytes(bufPtr, out); err != nil {
+		d.FDs.Close(gR)
+		d.FDs.Close(gW)
+		_ = syscall.Close(fds[0])
+		_ = syscall.Close(fds[1])
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
 }
 
 // handleClose services close(fd) (NR=57).
