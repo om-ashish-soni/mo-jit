@@ -140,3 +140,63 @@ func TestLoadConfigMissingFileFails(t *testing.T) {
 		t.Errorf("want ErrNotExist, got %v", err)
 	}
 }
+
+// ValidatePolicy creates a missing upper layer on the user's behalf
+// (first-run convenience) but still fails on a missing lower layer.
+func TestValidatePolicyCreatesMissingUpper(t *testing.T) {
+	dir := t.TempDir()
+	lower := filepath.Join(dir, "rootfs")
+	upper := filepath.Join(dir, "upper")
+	if err := os.Mkdir(lower, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{LowerDir: lower, UpperDir: upper}
+	if err := ValidatePolicy(p); err != nil {
+		t.Fatalf("ValidatePolicy: %v", err)
+	}
+	if _, err := os.Stat(upper); err != nil {
+		t.Errorf("upper not created: %v", err)
+	}
+}
+
+func TestValidatePolicyMissingRootfsFails(t *testing.T) {
+	dir := t.TempDir()
+	p := Policy{LowerDir: filepath.Join(dir, "absent"), UpperDir: filepath.Join(dir, "upper")}
+	err := ValidatePolicy(p)
+	if err == nil {
+		t.Fatal("want error for missing rootfs")
+	}
+	if !strings.Contains(err.Error(), "rootfs") {
+		t.Errorf("error should mention rootfs: %v", err)
+	}
+}
+
+func TestValidatePolicyRootfsNotADirFails(t *testing.T) {
+	dir := t.TempDir()
+	lower := filepath.Join(dir, "file-not-dir")
+	if err := os.WriteFile(lower, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{LowerDir: lower, UpperDir: filepath.Join(dir, "upper")}
+	err := ValidatePolicy(p)
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("want 'not a directory' error, got %v", err)
+	}
+}
+
+func TestValidatePolicyBindHostMustExist(t *testing.T) {
+	dir := t.TempDir()
+	lower := filepath.Join(dir, "rootfs")
+	if err := os.Mkdir(lower, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{
+		LowerDir: lower,
+		UpperDir: filepath.Join(dir, "upper"),
+		Binds:    []BindMount{{HostPath: filepath.Join(dir, "missing-bind"), GuestPath: "/mnt"}},
+	}
+	err := ValidatePolicy(p)
+	if err == nil || !strings.Contains(err.Error(), "binds[0]") {
+		t.Errorf("want binds[0] error, got %v", err)
+	}
+}

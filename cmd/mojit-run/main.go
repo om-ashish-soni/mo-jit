@@ -31,6 +31,7 @@ func main() {
 	upper := flag.String("upper", "", "absolute path to the writable upper layer (copy-on-write)")
 	netMode := flag.String("net", "", `network policy: "none" | "loopback-only" | "internet"`)
 	workdir := flag.String("workdir", "", "guest-side working directory for pid 1")
+	validateOnly := flag.Bool("validate", false, "validate policy and exit without launching the guest")
 	flag.Parse()
 
 	var (
@@ -95,6 +96,14 @@ func main() {
 	case "none", "loopback-only", "internet":
 	default:
 		log.Fatalf("mojit-run: invalid --net=%q (want none|loopback-only|internet)", policy.Net.Mode)
+	}
+
+	if err := gate.ValidatePolicy(policy); err != nil {
+		log.Fatalf("mojit-run: policy validation:\n%v", err)
+	}
+	if *validateOnly {
+		fmt.Fprintln(os.Stderr, "mojit-run: policy ok")
+		os.Exit(0)
 	}
 
 	d := gate.NewDispatcher(policy)

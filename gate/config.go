@@ -49,6 +49,55 @@ type ConfigNet struct {
 	DNS       []string `json:"dns"`
 }
 
+// ValidatePolicy checks that a Policy's host-side paths actually
+// exist and are usable. Intended for mojit-run startup — not
+// ParseConfig / LoadConfig, because those stay pure (no filesystem
+// side-effects) so tests can exercise them with fictional paths.
+//
+// Rules:
+//   - LowerDir must exist and be a directory. It's the guest's
+//     read-only rootfs; a missing one means nothing will load.
+//   - UpperDir must exist OR be creatable as a directory (we
+//     MkdirAll at most one level on the user's behalf; deeper
+//     paths surface as errors so typos don't silently spawn a
+//     directory tree in an unexpected place).
+//   - Binds: each HostPath must exist. GuestPath doesn't — it's a
+//     guest-side mount point and the gate creates it in the upper
+//     layer at runtime.
+func ValidatePolicy(p Policy) error {
+	var errs []error
+
+	if fi, err := os.Stat(p.LowerDir); err != nil {
+		errs = append(errs, fmt.Errorf("rootfs %q: %w", p.LowerDir, err))
+	} else if !fi.IsDir() {
+		errs = append(errs, fmt.Errorf("rootfs %q: not a directory", p.LowerDir))
+	}
+
+	if fi, err := os.Stat(p.UpperDir); err != nil {
+		if os.IsNotExist(err) {
+			// Create it — this is common for a first-run upper layer.
+			if mkErr := os.MkdirAll(p.UpperDir, 0o755); mkErr != nil {
+				errs = append(errs, fmt.Errorf("upper %q: %w", p.UpperDir, mkErr))
+			}
+		} else {
+			errs = append(errs, fmt.Errorf("upper %q: %w", p.UpperDir, err))
+		}
+	} else if !fi.IsDir() {
+		errs = append(errs, fmt.Errorf("upper %q: not a directory", p.UpperDir))
+	}
+
+	for i, b := range p.Binds {
+		if _, err := os.Stat(b.HostPath); err != nil {
+			errs = append(errs, fmt.Errorf("binds[%d] host %q: %w", i, b.HostPath, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
 // LoadConfig reads and validates a mojit.json at path. On success
 // returns the resolved Policy and the guest argv. A validation
 // failure reports all errors at once so a user fixing a config file
