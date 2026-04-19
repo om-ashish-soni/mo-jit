@@ -1529,6 +1529,58 @@ func linkatHost(oldPath, newPath string, flags int) error {
 	return nil
 }
 
+// handleGetDents64 services getdents64(fd, dirp, count) (NR=61). Shells
+// and file browsers call this on every `ls`, `find`, and tab-completion
+// — second-most-important fd-ops handler after read/write.
+//
+// Currently we proxy the host kernel's own getdents64 verbatim. Works
+// correctly for directories that live on exactly ONE layer (upper or
+// lower). Known limitations, tracked for the overlay-merge follow-up:
+//
+//   - Directories that exist on BOTH layers return only the host-fd's
+//     view (whichever layer the openat handler picked). Upper-side
+//     additions AND whiteouts-masking-lower are both invisible. The
+//     fix is to build a merged entry list: read upper dir, read lower
+//     dir, subtract names whited out on upper, dedup on name.
+//   - mknod-style whiteout char-device entries leak through to the
+//     guest as visible files. Callers that stat the entry recover via
+//     FSGate.Resolve's whiteout filter, but a naive getdents64 dump
+//     will show the whiteout name.
+//
+// linux_dirent64 is architecture-independent (same layout on arm64 and
+// amd64), so we can pass the kernel's raw bytes straight through the
+// MemWriter without any repacking.
+func handleGetDents64(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+	count := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if count == 0 {
+		regs.X[0] = 0
+		return VerdictHandled
+	}
+
+	buf := make([]byte, count)
+	n, err := syscall.ReadDirent(hostFd, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(bufPtr, buf[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
