@@ -83,21 +83,18 @@ func (d *Dispatcher) Dispatch(regs *Regs) Verdict {
 
 // registerDefaults installs the default handler table.
 //
-// TODO(M2): populate with openat / newfstatat / faccessat / chdir /
-// getcwd / readlinkat / mkdirat / unlinkat / renameat handlers that
-// use FSGate.Resolve. Path args require reading guest memory, which
-// the cgo bridge will expose via a PathReader interface — that
-// interface lands with the first real handler implementation.
+// TODO(M2): add openat / newfstatat / faccessat / getcwd / readlinkat
+// / mkdirat / unlinkat / renameat handlers. chdir is wired below as
+// the simplest pure-one-path handler that exercises the
+// PathReader → AbsFromGuest → FSGate.Resolve → host-syscall chain.
 //
 // TODO(M3): populate with socket / connect / bind / send* / recv* /
 // getsockname handlers that use NetGate.CheckConnect and create real
 // host sockets.
 //
-// For now the table is empty: every syscall falls through to
-// VerdictPassthrough. This is the correct behaviour for a
-// not-yet-wired build — the unit under test is the dispatch
-// mechanism, not the policy.
+// Syscalls not listed here fall through to VerdictPassthrough — the
+// correct behaviour for policy-free calls (futex, clock_gettime,
+// getrandom, ...) and the safe default during bring-up.
 func (d *Dispatcher) registerDefaults() {
-	// Intentionally empty until M2 path-reader + M3 net handlers
-	// land. See TODO comments above.
+	d.handlers[SysChDir] = handleChDir
 }
