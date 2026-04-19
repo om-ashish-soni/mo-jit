@@ -7,7 +7,7 @@ specific release; mo-jit-specific sources (C glue into `gate/`, the
 memfd-backed code cache, Android build script outputs) live alongside
 in this directory as they land.
 
-## Current state (2026-04-18)
+## Current state (2026-04-19)
 
 - Submodule `frida-gum/` is pinned to upstream tag **17.9.1**
   (commit `8bf4e03`).
@@ -17,8 +17,18 @@ in this directory as they land.
   (NDK r26+ cross-build into `build/android-arm64/`).
 - Strip inventory: [`STRIP_LIST.md`](./STRIP_LIST.md) — the canonical
   list of what we drop from upstream and why.
-- M1 work (arm64 slice + memfd W^X cache + svc hook ABI) is queued;
-  nothing has been linked yet.
+- svc-hook ABI landed: [`mojit_hook.h`](./mojit_hook.h) defines the
+  gum ↔ gate contract, [`mojit_hook.c`](./mojit_hook.c) implements the
+  register/enter/init/shutdown lifecycle, and
+  [`mojit_hook_test.c`](./mojit_hook_test.c) pins the behaviour under CI.
+- memfd W^X code-cache allocator landed:
+  [`memfd_alloc.c`](./memfd_alloc.c) backs `mojit_code_alloc` /
+  `mojit_code_free` with a page-aligned `memfd_create` + `ftruncate`
+  + `mmap(PROT_RWX, MAP_SHARED)`, tested on x86_64 and aarch64 via
+  [`memfd_alloc_test.c`](./memfd_alloc_test.c) (writes machine code
+  into the region and executes it).
+- Remaining M1 work: link `libmojit-gum.so` from the stripped upstream
+  slice and wire Stalker's svc interceptor to `mojit_hook_enter()`.
 
 ## Checkout
 
@@ -73,12 +83,14 @@ gum/
 └── frida-gum/        ← submodule (upstream fork at pinned tag)
 ```
 
-Once the C glue lands (M1), expect additional files under `gum/`:
+C glue currently under `gum/`:
 
 ```
 gum/
-├── mojit_hook.c      ← svc hook → gate dispatcher trampoline
-├── mojit_hook.h      ← public C ABI consumed by shell/
-├── memfd_alloc.c     ← W^X-friendly code cache allocator
-└── ... patches applied on top of frida-gum, if any
+├── mojit_hook.h            ← public C ABI consumed by shell/ and gate/
+├── mojit_hook.c            ← svc hook lifecycle + default passthrough
+├── mojit_hook_test.c       ← portable smoke test (runs in CI)
+├── memfd_alloc.c           ← memfd-backed W^X code cache allocator
+├── memfd_alloc_test.c      ← portable alloc/exec smoke test (runs in CI)
+└── ... patches applied on top of frida-gum, if any (none yet)
 ```
