@@ -2942,6 +2942,269 @@ func encodeSockaddr(sa syscall.Sockaddr) ([]byte, error) {
 	}
 }
 
+// msghdrSize is sizeof(struct msghdr) on LP64 (aarch64 and x86_64
+// agree). Layout:
+//
+//	0  void*     msg_name       (8)
+//	8  socklen_t msg_namelen    (4 + 4 pad)
+//	16 void*     msg_iov        (8)
+//	24 size_t    msg_iovlen     (8)
+//	32 void*     msg_control    (8)
+//	40 size_t    msg_controllen (8)
+//	48 int       msg_flags      (4 + 4 pad)
+const msghdrSize = 56
+
+// iovecSize is sizeof(struct iovec) on LP64.
+const iovecSize = 16
+
+// maxSendMsgIov caps the iovec count we'll walk in one sendmsg /
+// recvmsg. Linux IOV_MAX is typically 1024 — matching it means no
+// legitimate caller hits the cap.
+const maxSendMsgIov = 1024
+
+// maxSendMsgBytes caps the total scatter-gather payload at 64 MiB
+// per call. Stops a malicious guest from coercing the gate into
+// arbitrary allocations.
+const maxSendMsgBytes = 64 * 1024 * 1024
+
+// handleSendMsg services sendmsg(sockfd, msg, flags) (NR=211). We
+// read the msghdr, pull the iovec array, concatenate each scatter
+// entry into one host-side buffer, and forward via syscall.Sendto.
+// Concatenation is semantically equivalent to true scatter for both
+// stream and datagram sockets (the receiver sees the same byte
+// sequence), so we sidestep a raw SYS_SENDMSG call.
+//
+// msg_name, if present, is decoded and policy-checked exactly like
+// sendto's dest_addr. msg_control is deferred: non-zero control
+// length returns ENOSYS because fd-passing over AF_UNIX needs FSGate
+// path translation that isn't wired yet.
+func handleSendMsg(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	msgPtr := regs.X[1]
+	flags := int(regs.X[2])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	hdr, err := d.MemR.ReadBytes(msgPtr, msghdrSize)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	namePtr := binary.LittleEndian.Uint64(hdr[0:8])
+	nameLen := int(binary.LittleEndian.Uint32(hdr[8:12]))
+	iovPtr := binary.LittleEndian.Uint64(hdr[16:24])
+	iovLen := int(binary.LittleEndian.Uint64(hdr[24:32]))
+	controlLen := int(binary.LittleEndian.Uint64(hdr[40:48]))
+
+	if controlLen != 0 {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+	if iovLen < 0 || iovLen > maxSendMsgIov {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+
+	// Concatenate iovecs into a single buffer.
+	var payload []byte
+	if iovLen > 0 {
+		iovs, err := d.MemR.ReadBytes(iovPtr, iovLen*iovecSize)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		total := 0
+		for i := 0; i < iovLen; i++ {
+			off := i * iovecSize
+			n := int(binary.LittleEndian.Uint64(iovs[off+8 : off+16]))
+			if n < 0 {
+				regs.X[0] = EncodeErrno(syscall.EINVAL)
+				return VerdictHandled
+			}
+			total += n
+			if total > maxSendMsgBytes {
+				regs.X[0] = EncodeErrno(syscall.EMSGSIZE)
+				return VerdictHandled
+			}
+		}
+		payload = make([]byte, 0, total)
+		for i := 0; i < iovLen; i++ {
+			off := i * iovecSize
+			base := binary.LittleEndian.Uint64(iovs[off : off+8])
+			n := int(binary.LittleEndian.Uint64(iovs[off+8 : off+16]))
+			if n == 0 {
+				continue
+			}
+			chunk, err := d.MemR.ReadBytes(base, n)
+			if err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+			payload = append(payload, chunk...)
+		}
+	}
+
+	var dest syscall.Sockaddr
+	if namePtr != 0 && nameLen > 0 {
+		if nameLen < 2 {
+			regs.X[0] = EncodeErrno(syscall.EINVAL)
+			return VerdictHandled
+		}
+		nameBytes, err := d.MemR.ReadBytes(namePtr, nameLen)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		family := binary.LittleEndian.Uint16(nameBytes[0:2])
+		sa, ap, derr := decodeSockaddr(family, nameBytes)
+		if derr != nil {
+			regs.X[0] = EncodeErrno(derr)
+			return VerdictHandled
+		}
+		if err := d.Net.CheckConnect(ap); err != nil {
+			regs.X[0] = EncodeErrno(syscall.EACCES)
+			return VerdictHandled
+		}
+		dest = sa
+	}
+
+	if err := syscall.Sendto(hostFd, payload, flags, dest); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(len(payload))
+	return VerdictHandled
+}
+
+// handleRecvMsg services recvmsg(sockfd, msg, flags) (NR=212). We
+// read the msghdr, allocate a single host buffer large enough to
+// hold the sum of iovec lengths, call recvfrom, and scatter the
+// received bytes across the iovec destinations in guest memory.
+//
+// msg_name (if requested) is filled with the peer's sockaddr and
+// msg_namelen is updated to the full sockaddr size. msg_control is
+// always emptied: we accept a non-zero controllen on input (common)
+// but write back controllen=0 (we don't synthesize cmsgs).
+// msg_flags is written 0 (no truncation, no cmsg truncation); full
+// flag handling is a follow-up.
+func handleRecvMsg(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	msgPtr := regs.X[1]
+	flags := int(regs.X[2])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	hdr, err := d.MemR.ReadBytes(msgPtr, msghdrSize)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	namePtr := binary.LittleEndian.Uint64(hdr[0:8])
+	nameLen := int(binary.LittleEndian.Uint32(hdr[8:12]))
+	iovPtr := binary.LittleEndian.Uint64(hdr[16:24])
+	iovLen := int(binary.LittleEndian.Uint64(hdr[24:32]))
+
+	if iovLen < 0 || iovLen > maxSendMsgIov {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+
+	// Read iovec array + compute total capacity.
+	var iovs []byte
+	total := 0
+	if iovLen > 0 {
+		b, err := d.MemR.ReadBytes(iovPtr, iovLen*iovecSize)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		iovs = b
+		for i := 0; i < iovLen; i++ {
+			off := i * iovecSize
+			n := int(binary.LittleEndian.Uint64(iovs[off+8 : off+16]))
+			if n < 0 {
+				regs.X[0] = EncodeErrno(syscall.EINVAL)
+				return VerdictHandled
+			}
+			total += n
+			if total > maxSendMsgBytes {
+				regs.X[0] = EncodeErrno(syscall.EMSGSIZE)
+				return VerdictHandled
+			}
+		}
+	}
+
+	buf := make([]byte, total)
+	n, from, err := syscall.Recvfrom(hostFd, buf, flags)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	// Scatter across iovecs.
+	written := 0
+	for i := 0; i < iovLen && written < n; i++ {
+		off := i * iovecSize
+		base := binary.LittleEndian.Uint64(iovs[off : off+8])
+		ilen := int(binary.LittleEndian.Uint64(iovs[off+8 : off+16]))
+		if ilen == 0 {
+			continue
+		}
+		take := ilen
+		if n-written < take {
+			take = n - written
+		}
+		if err := d.Mem.WriteBytes(base, buf[written:written+take]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		written += take
+	}
+
+	// Update msg_namelen and msg_name if the caller asked for peer.
+	if namePtr != 0 && nameLen > 0 && from != nil {
+		if saBytes, encErr := encodeSockaddr(from); encErr == nil {
+			avail := len(saBytes)
+			if nameLen < avail {
+				avail = nameLen
+			}
+			if avail > 0 {
+				if err := d.Mem.WriteBytes(namePtr, saBytes[:avail]); err != nil {
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+			var lb [4]byte
+			binary.LittleEndian.PutUint32(lb[:], uint32(len(saBytes)))
+			if err := d.Mem.WriteBytes(msgPtr+8, lb[:]); err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+		}
+	}
+
+	// Write msg_controllen = 0 and msg_flags = 0.
+	var zero8 [8]byte
+	if err := d.Mem.WriteBytes(msgPtr+40, zero8[:]); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	var zero4 [4]byte
+	if err := d.Mem.WriteBytes(msgPtr+48, zero4[:]); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
 // handleShutdown services shutdown(sockfd, how) (NR=210). Pure
 // passthrough aside from fd resolution: the guest is closing half-
 // or-full of a connection it already owns, and there is nothing

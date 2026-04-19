@@ -215,4 +215,6 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysShutdown] = handleShutdown
 	d.handlers[SysSetSockOpt] = handleSetSockOpt
 	d.handlers[SysGetSockOpt] = handleGetSockOpt
+	d.handlers[SysSendMsg] = handleSendMsg
+	d.handlers[SysRecvMsg] = handleRecvMsg
 }
