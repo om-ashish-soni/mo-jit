@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -396,6 +397,90 @@ func handleWrite(d *Dispatcher, regs *Regs) Verdict {
 		return VerdictHandled
 	}
 	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// handleMkdirAt services mkdirat(dirfd, pathname, mode) (NR=34).
+//
+// aarch64 layout:
+//
+//	x0 = dirfd, x1 = pathname, x2 = mode
+//
+// Semantics:
+//   - No UpperDir: EROFS. Everything else assumes a writable overlay.
+//   - Path already resolvable (lower OR non-whiteout upper): EEXIST,
+//     matching Linux mkdir(2).
+//   - Whiteout on upper: the guest sees a freshly-created directory,
+//     so we remove the whiteout first and then mkdir — otherwise
+//     os.Mkdir fails with EEXIST against the whiteout file entry.
+//   - Parent chain missing on upper but present on lower: we
+//     os.MkdirAll the upper parents with 0o755 before creating the
+//     leaf, so stat of the new dir hits upper. This is the directory
+//     analogue of copy-up for files — we're promoting the enclosing
+//     namespace to upper so the new entry is visible to the guest.
+//
+// Missing parents that don't exist on lower either will surface as
+// ENOENT from MkdirAll's first Mkdir (wrapped by errnoFor → ENOENT).
+func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	mode := uint32(regs.X[2])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	var absGuest string
+	switch {
+	case filepath.IsAbs(path):
+		absGuest = filepath.Clean(path)
+	case dirfd == int64(atFDCWD):
+		absGuest = d.FS.AbsFromGuest(path)
+	default:
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	upperPath := filepath.Join(d.FS.policy.UpperDir, absGuest)
+
+	// Resolve tells us whether any layer CLAIMS this path (ErrWhiteout
+	// if hidden, nil otherwise — but nil does NOT prove existence on
+	// lower; Resolve joins paths without statting). We still need to
+	// probe both layers for a real inode before deciding EEXIST.
+	hostPath, _, rerr := d.FS.Resolve(absGuest)
+	switch {
+	case errors.Is(rerr, ErrWhiteout):
+		if err := os.Remove(upperPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		// Whiteout removed — treat path as free and fall through.
+	case rerr != nil:
+		regs.X[0] = EncodeErrno(rerr)
+		return VerdictHandled
+	default:
+		if _, err := os.Lstat(hostPath); err == nil {
+			regs.X[0] = EncodeErrno(syscall.EEXIST)
+			return VerdictHandled
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(upperPath), 0o755); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if err := os.Mkdir(upperPath, os.FileMode(mode&0o7777)); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
 	return VerdictHandled
 }
 

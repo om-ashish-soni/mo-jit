@@ -130,4 +130,5 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysWrite] = handleWrite
 	d.handlers[SysNewFStatAt] = handleNewFStatAt
 	d.handlers[SysFStat] = handleFStat
+	d.handlers[SysMkdirAt] = handleMkdirAt
 }
