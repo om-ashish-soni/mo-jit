@@ -2,6 +2,7 @@ package gate
 
 import (
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -219,5 +220,118 @@ func handleReadLinkAt(d *Dispatcher, regs *Regs) Verdict {
 		}
 	}
 	regs.X[0] = uint64(len(payload))
+	return VerdictHandled
+}
+
+// openWritableMask captures every bit that means "this open wants to
+// write, or wants the kernel to mutate the filesystem on the way in".
+// O_RDONLY (=0) has no bits set; any of these flags implies the open
+// hits an upper-layer path.
+const openWritableMask = syscall.O_WRONLY |
+	syscall.O_RDWR |
+	syscall.O_CREAT |
+	syscall.O_TRUNC |
+	syscall.O_APPEND
+
+// handleOpenAt services openat(dirfd, pathname, flags, mode) (NR=56).
+//
+// Currently supported:
+//   - dirfd == AT_FDCWD, or a path that is absolute (dirfd ignored
+//     per Linux). Dir-relative paths with a real dirfd return ENOSYS
+//     until openat2(RESOLVE_IN_ROOT) is wired in M3 — we cannot safely
+//     let the host kernel resolve a relative path against a host fd
+//     whose directory sits inside the lower layer, because `..`
+//     traversal would escape the overlay.
+//   - read-only opens against any layer.
+//   - writable opens (O_WRONLY / O_RDWR / O_CREAT / O_TRUNC / O_APPEND)
+//     that resolve to the UPPER or BIND layer.
+//
+// Not yet supported:
+//   - Writable opens that resolve to LOWER — requires copy-up. We
+//     return EROFS so callers either stop or upper-promote their file
+//     explicitly. A later commit will implement copy-up.
+//   - O_TMPFILE. Returns EOPNOTSUPP for now.
+func handleOpenAt(d *Dispatcher, regs *Regs) Verdict {
+	path, err := d.Paths.ReadPath(regs.X[1], MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	flags := int(regs.X[2])
+	mode := uint32(regs.X[3])
+	dirfd := int64(regs.X[0])
+
+	var absGuest string
+	switch {
+	case filepath.IsAbs(path):
+		absGuest = filepath.Clean(path)
+	case dirfd == int64(atFDCWD):
+		absGuest = d.FS.AbsFromGuest(path)
+	default:
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	writable := flags&openWritableMask != 0
+	if writable && layer == LayerLower {
+		// Two sub-cases:
+		//   (a) File exists on lower -> real copy-up is needed
+		//       before we can write. Not yet implemented; surface
+		//       EROFS so callers notice loudly.
+		//   (b) File is missing from lower AND O_CREAT AND Upper is
+		//       configured -> redirect the create to the upper
+		//       layer so it's born writable. Parent directory
+		//       creation on upper isn't attempted here; for nested
+		//       paths callers must mkdirat first.
+		if flags&syscall.O_CREAT != 0 && d.FS.policy.UpperDir != "" {
+			if _, statErr := os.Lstat(hostPath); os.IsNotExist(statErr) {
+				hostPath = filepath.Join(d.FS.policy.UpperDir, absGuest)
+			} else {
+				regs.X[0] = EncodeErrno(syscall.EROFS)
+				return VerdictHandled
+			}
+		} else {
+			regs.X[0] = EncodeErrno(syscall.EROFS)
+			return VerdictHandled
+		}
+	}
+
+	hostFd, err := syscall.Open(hostPath, flags, mode)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	guestFd := d.FDs.Allocate(hostFd)
+	regs.X[0] = uint64(guestFd)
+	return VerdictHandled
+}
+
+// handleClose services close(fd) (NR=57).
+//
+// Releases the guest fd from the table, then close(2)s the backing
+// host fd. Errors from close(2) (EIO on NFS etc.) are propagated to
+// the guest even though the fd is already gone on our side — this
+// matches Linux semantics, where close can report a deferred I/O
+// error but the fd is still freed.
+func handleClose(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	hostFd, ok := d.FDs.Close(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Close(hostFd); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
 	return VerdictHandled
 }
