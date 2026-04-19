@@ -2703,6 +2703,194 @@ func decodeSockaddr(family uint16, buf []byte) (syscall.Sockaddr, netip.AddrPort
 	}
 }
 
+// handleSendTo services sendto(sockfd, buf, len, flags, dest_addr,
+// addrlen) (NR=206). write(2) already handles connected sockets; this
+// handler exists for the unconnected-UDP shape — notably musl's DNS
+// resolver, which creates an AF_INET DGRAM socket and sendto's each
+// query to the resolver directly. Every DNS lookup the guest makes
+// flows through this path.
+//
+// aarch64 layout:
+//
+//	x0 = sockfd, x1 = buf, x2 = len,
+//	x3 = flags, x4 = dest_addr, x5 = addrlen.
+//
+// When dest_addr is non-NULL and resolves to an AF_INET/AF_INET6
+// destination, NetGate.CheckConnect vets it against policy exactly
+// like connect() does — same builtin-deny, same mode-specific rules.
+// The two handlers share enforcement so there's no "bypass connect
+// by using sendto" trick.
+//
+// dest_addr == 0 means "use the socket's connected peer", mirroring
+// write(2) semantics; we skip the policy check (connect already did
+// it) and let the kernel deliver EDESTADDRREQ if the socket isn't
+// actually connected.
+func handleSendTo(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+	bufLen := int(regs.X[2])
+	flags := int(regs.X[3])
+	destPtr := regs.X[4]
+	destLen := int(regs.X[5])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if bufLen < 0 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	var buf []byte
+	if bufLen > 0 {
+		b, err := d.MemR.ReadBytes(bufPtr, bufLen)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		buf = b
+	}
+
+	var sa syscall.Sockaddr
+	if destPtr != 0 {
+		if destLen < 2 {
+			regs.X[0] = EncodeErrno(syscall.EINVAL)
+			return VerdictHandled
+		}
+		saBytes, err := d.MemR.ReadBytes(destPtr, destLen)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		family := binary.LittleEndian.Uint16(saBytes[0:2])
+		decoded, ap, derr := decodeSockaddr(family, saBytes)
+		if derr != nil {
+			regs.X[0] = EncodeErrno(derr)
+			return VerdictHandled
+		}
+		if err := d.Net.CheckConnect(ap); err != nil {
+			regs.X[0] = EncodeErrno(syscall.EACCES)
+			return VerdictHandled
+		}
+		sa = decoded
+	}
+
+	if err := syscall.Sendto(hostFd, buf, flags, sa); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(bufLen)
+	return VerdictHandled
+}
+
+// handleRecvFrom services recvfrom(sockfd, buf, len, flags, src_addr,
+// addrlen_ptr) (NR=207). Paired with sendto for unconnected-UDP; also
+// the shape musl's DNS resolver uses to read the reply. When src_addr
+// is non-NULL the kernel writes the sender's sockaddr there, and the
+// updated length into *addrlen.
+//
+// aarch64 layout:
+//
+//	x0 = sockfd, x1 = buf, x2 = len, x3 = flags,
+//	x4 = src_addr, x5 = addrlen_ptr.
+//
+// We allocate a host-side buffer of len bytes, recvfrom into it, copy
+// the received prefix back into guest memory, and encode the remote
+// sockaddr (if requested) back to the guest. Truncation is handled by
+// the kernel — MSG_TRUNC etc. pass through via flags unchanged.
+func handleRecvFrom(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	bufPtr := regs.X[1]
+	bufLen := int(regs.X[2])
+	flags := int(regs.X[3])
+	srcPtr := regs.X[4]
+	srcLenPtr := regs.X[5]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if bufLen < 0 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	host := make([]byte, bufLen)
+	n, from, err := syscall.Recvfrom(hostFd, host, flags)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if n > 0 {
+		if err := d.Mem.WriteBytes(bufPtr, host[:n]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+
+	if srcPtr != 0 && from != nil {
+		saBytes, err := encodeSockaddr(from)
+		if err != nil {
+			// Unencodable family — deliver the recv result without
+			// src_addr; caller can still read the payload. This is
+			// preferable to failing the whole recv for exotic peers.
+		} else {
+			// Clamp to the guest-provided addrlen if it was supplied.
+			avail := len(saBytes)
+			if srcLenPtr != 0 {
+				var lenBuf [4]byte
+				lb, lerr := d.MemR.ReadBytes(srcLenPtr, 4)
+				if lerr == nil {
+					copy(lenBuf[:], lb)
+					glen := int(binary.LittleEndian.Uint32(lenBuf[:]))
+					if glen < avail {
+						avail = glen
+					}
+				}
+			}
+			if err := d.Mem.WriteBytes(srcPtr, saBytes[:avail]); err != nil {
+				regs.X[0] = EncodeErrno(err)
+				return VerdictHandled
+			}
+			if srcLenPtr != 0 {
+				var lenBuf [4]byte
+				binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(saBytes)))
+				if err := d.Mem.WriteBytes(srcLenPtr, lenBuf[:]); err != nil {
+					regs.X[0] = EncodeErrno(err)
+					return VerdictHandled
+				}
+			}
+		}
+	}
+
+	regs.X[0] = uint64(n)
+	return VerdictHandled
+}
+
+// encodeSockaddr is the inverse of decodeSockaddr: it turns the
+// kernel-returned Sockaddr (AF_INET or AF_INET6) back into the wire
+// format the guest expects on the other side of an out-param.
+func encodeSockaddr(sa syscall.Sockaddr) ([]byte, error) {
+	switch s := sa.(type) {
+	case *syscall.SockaddrInet4:
+		buf := make([]byte, 16)
+		binary.LittleEndian.PutUint16(buf[0:2], uint16(syscall.AF_INET))
+		binary.BigEndian.PutUint16(buf[2:4], uint16(s.Port))
+		copy(buf[4:8], s.Addr[:])
+		return buf, nil
+	case *syscall.SockaddrInet6:
+		buf := make([]byte, 28)
+		binary.LittleEndian.PutUint16(buf[0:2], uint16(syscall.AF_INET6))
+		binary.BigEndian.PutUint16(buf[2:4], uint16(s.Port))
+		copy(buf[8:24], s.Addr[:])
+		binary.LittleEndian.PutUint32(buf[24:28], s.ZoneId)
+		return buf, nil
+	default:
+		return nil, syscall.EAFNOSUPPORT
+	}
+}
+
 // handleSocket services socket(domain, type, protocol) (NR=198). Entry
 // point for the NetGate family — nothing else in the net path works
 // until this one allocates a guest fd backed by a real host socket.
