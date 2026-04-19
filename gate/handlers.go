@@ -174,3 +174,50 @@ func handleGetCwd(d *Dispatcher, regs *Regs) Verdict {
 	regs.X[0] = uint64(len(out))
 	return VerdictHandled
 }
+
+// handleReadLinkAt services readlinkat(dirfd, pathname, buf, bufsiz)
+// (NR=78).
+//
+// Kernel semantics: on success, returns the number of BYTES placed in
+// buf (NOT NUL-terminated, possibly truncated). If len(target) >
+// bufsiz, only bufsiz bytes are written and the truncated byte count
+// is returned — this is NOT an error per Linux readlinkat(2).
+//
+// The gate reads the link target via os.Readlink on the resolved host
+// path, which returns the raw bytes the link stores on disk. That is
+// the correct guest-visible content: a symlink like "../bar" is
+// copied verbatim, and its interpretation happens on the guest's
+// next path syscall (which will absolute-ify and FSGate-resolve it).
+func handleReadLinkAt(d *Dispatcher, regs *Regs) Verdict {
+	hostPath, _, err := resolveGuestPathAt(d, int64(regs.X[0]), regs.X[1])
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	bufPtr := regs.X[2]
+	bufSiz := regs.X[3]
+	if bufSiz == 0 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+
+	target, err := os.Readlink(hostPath)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	payload := []byte(target)
+	if uint64(len(payload)) > bufSiz {
+		payload = payload[:bufSiz]
+	}
+	if len(payload) > 0 {
+		if err := d.Mem.WriteBytes(bufPtr, payload); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = uint64(len(payload))
+	return VerdictHandled
+}

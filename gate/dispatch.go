@@ -107,4 +107,5 @@ func (d *Dispatcher) registerDefaults() {
 	d.handlers[SysFAccessAt] = handleFAccessAt
 	d.handlers[SysFAccessAt2] = handleFAccessAt
 	d.handlers[SysGetCwd] = handleGetCwd
+	d.handlers[SysReadLinkAt] = handleReadLinkAt
 }
