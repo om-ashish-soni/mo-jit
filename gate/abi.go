@@ -93,6 +93,8 @@ const (
 	SysSymlinkAt  uint64 = 36
 	SysLinkAt     uint64 = 37
 	SysRenameAt   uint64 = 38
+	SysTruncate   uint64 = 45
+	SysFTruncate  uint64 = 46
 	SysFAccessAt  uint64 = 48
 	SysChDir      uint64 = 49
 	SysOpenAt     uint64 = 56

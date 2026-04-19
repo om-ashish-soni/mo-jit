@@ -1581,6 +1581,85 @@ func handleGetDents64(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleFTruncate services ftruncate(fd, length) (NR=46).
+//
+// Pure fd passthrough — the guest fd was bound to a host fd at open
+// time, and any copy-up that needed to happen already happened there.
+// If the guest opened the file read-only, the host kernel surfaces
+// EBADF from the ftruncate(2) itself and we propagate.
+func handleFTruncate(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	length := int64(regs.X[1])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Ftruncate(hostFd, length); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleTruncate services truncate(path, length) (NR=45). Unlike
+// ftruncate, there's no fd that already rode through openat's
+// copy-up, so we have to handle the layer split here.
+//
+// aarch64 layout: x0 = path, x1 = length.
+//
+// Semantics:
+//   - No UpperDir: EROFS — the overlay is genuinely read-only.
+//   - Whiteout at path: ENOENT.
+//   - Path on lower only: CopyUp then truncate the upper copy —
+//     future reads still see the truncated content because upper
+//     now masks lower for this name.
+//   - Path on upper: truncate in place.
+func handleTruncate(d *Dispatcher, regs *Regs) Verdict {
+	pathPtr := regs.X[0]
+	length := int64(regs.X[1])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest := d.FS.AbsFromGuest(path)
+
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		// Confirm lower has the file before copying — Resolve can
+		// return nil for any lower path, without statting.
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+	if err := syscall.Truncate(hostPath, length); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
