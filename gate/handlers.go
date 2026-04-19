@@ -1969,12 +1969,13 @@ const utimeNow = ((1 << 30) - 1)
 // tv_nsec may hold the magic UTIME_NOW or UTIME_OMIT; the kernel
 // interprets those in-struct so we just forward the bytes.
 //
-// Not yet supported (return ENOSYS so missing coverage is loud):
-//   - path == NULL (futimens-style, needs dirfd→hostFd handling)
-//   - AT_SYMLINK_NOFOLLOW (rare; would require raw syscall).
-//
-// Like fchmodat, lower-only files are copied up before the timestamp
-// update so it actually sticks from the guest's next stat.
+// Two shapes the kernel allows:
+//   - path != NULL: operate on (dirfd, path); honour AT_SYMLINK_NOFOLLOW
+//     to touch the link itself instead of its target. Copy-up first so
+//     the stamp lands on the upper layer.
+//   - path == NULL: libc's futimens(fd, ts) translates to
+//     utimensat(fd, NULL, ts, 0). Resolve the guest fd to a host fd and
+//     call the raw syscall with a NULL path.
 func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 	dirfd := int64(regs.X[0])
 	pathPtr := regs.X[1]
@@ -1985,12 +1986,36 @@ func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 		regs.X[0] = EncodeErrno(syscall.EROFS)
 		return VerdictHandled
 	}
-	if flags&atSymlinkNoFollow != 0 {
-		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+
+	ts, err := readUtimensTimes(d, timesPtr)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
 		return VerdictHandled
 	}
+
+	// futimens-style: path NULL, dirfd names the file. AT_FDCWD with
+	// NULL path is undefined on real kernels; mirror that with EBADF.
 	if pathPtr == 0 {
-		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		if flags != 0 {
+			// Linux rejects any flags when path==NULL; AT_SYMLINK_NOFOLLOW
+			// has no meaning against an already-open fd.
+			regs.X[0] = EncodeErrno(syscall.EINVAL)
+			return VerdictHandled
+		}
+		if dirfd == int64(atFDCWD) {
+			regs.X[0] = EncodeErrno(syscall.EBADF)
+			return VerdictHandled
+		}
+		hostFd, ok := d.FDs.Resolve(int(dirfd))
+		if !ok {
+			regs.X[0] = EncodeErrno(syscall.EBADF)
+			return VerdictHandled
+		}
+		if errno := rawUtimensAt(hostFd, "", ts, 0); errno != 0 {
+			regs.X[0] = EncodeErrno(errno)
+			return VerdictHandled
+		}
+		regs.X[0] = 0
 		return VerdictHandled
 	}
 
@@ -2011,6 +2036,9 @@ func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 		return VerdictHandled
 	}
 	if layer == LayerLower {
+		// Lstat so symlinks promote-as-symlinks when NOFOLLOW is set:
+		// CopyUp's symlink branch recreates the link on upper, and the
+		// raw utimensat with NOFOLLOW below touches the link itself.
 		if _, err := os.Lstat(hostPath); err != nil {
 			regs.X[0] = EncodeErrno(err)
 			return VerdictHandled
@@ -2023,25 +2051,15 @@ func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 		hostPath = upperPath
 	}
 
-	var ts []syscall.Timespec
-	if timesPtr != 0 {
-		buf, err := d.MemR.ReadBytes(timesPtr, 32)
-		if err != nil {
-			regs.X[0] = EncodeErrno(err)
+	if flags&atSymlinkNoFollow != 0 {
+		// Go's UtimesNano always follows symlinks (flags=0 internally);
+		// for NOFOLLOW we go raw.
+		if errno := rawUtimensAt(atFDCWD, hostPath, ts, atSymlinkNoFollow); errno != 0 {
+			regs.X[0] = EncodeErrno(errno)
 			return VerdictHandled
 		}
-		ts = []syscall.Timespec{
-			{Sec: int64(binary.LittleEndian.Uint64(buf[0:8])), Nsec: int64(binary.LittleEndian.Uint64(buf[8:16]))},
-			{Sec: int64(binary.LittleEndian.Uint64(buf[16:24])), Nsec: int64(binary.LittleEndian.Uint64(buf[24:32]))},
-		}
-	} else {
-		// NULL times → current time for both. Go's UtimesNano with nil
-		// slice maps to utimes(..., NULL) which EINVALs under utimensat;
-		// pass two UTIME_NOW timespecs so the kernel stamps now.
-		ts = []syscall.Timespec{
-			{Sec: 0, Nsec: utimeNow},
-			{Sec: 0, Nsec: utimeNow},
-		}
+		regs.X[0] = 0
+		return VerdictHandled
 	}
 	if err := syscall.UtimesNano(hostPath, ts); err != nil {
 		regs.X[0] = EncodeErrno(err)
@@ -2049,6 +2067,57 @@ func handleUtimensAt(d *Dispatcher, regs *Regs) Verdict {
 	}
 	regs.X[0] = 0
 	return VerdictHandled
+}
+
+// readUtimensTimes decodes the 32-byte struct timespec[2] at timesPtr,
+// or synthesises a (UTIME_NOW, UTIME_NOW) pair when timesPtr is NULL.
+// Go's UtimesNano with a nil slice maps to utimes(..., NULL) which
+// EINVALs under utimensat; the sentinel pair keeps the kernel happy
+// and matches what futimens(fd, NULL) expects.
+func readUtimensTimes(d *Dispatcher, timesPtr uint64) ([]syscall.Timespec, error) {
+	if timesPtr == 0 {
+		return []syscall.Timespec{
+			{Sec: 0, Nsec: utimeNow},
+			{Sec: 0, Nsec: utimeNow},
+		}, nil
+	}
+	buf, err := d.MemR.ReadBytes(timesPtr, 32)
+	if err != nil {
+		return nil, err
+	}
+	return []syscall.Timespec{
+		{Sec: int64(binary.LittleEndian.Uint64(buf[0:8])), Nsec: int64(binary.LittleEndian.Uint64(buf[8:16]))},
+		{Sec: int64(binary.LittleEndian.Uint64(buf[16:24])), Nsec: int64(binary.LittleEndian.Uint64(buf[24:32]))},
+	}, nil
+}
+
+// rawUtimensAt wraps SYS_UTIMENSAT directly so the handler can pass a
+// NULL path (futimens shape) or non-zero flags (AT_SYMLINK_NOFOLLOW) —
+// neither is reachable through Go's typed syscall.UtimesNano. An empty
+// path argument serialises to NULL, matching what the kernel wants for
+// futimens-via-utimensat.
+func rawUtimensAt(dirfd int, path string, ts []syscall.Timespec, flags int) syscall.Errno {
+	var pathArg uintptr
+	if path != "" {
+		p, err := syscall.BytePtrFromString(path)
+		if err != nil {
+			return syscall.EINVAL
+		}
+		pathArg = uintptr(unsafe.Pointer(p))
+	}
+	var tsArg uintptr
+	if len(ts) > 0 {
+		tsArg = uintptr(unsafe.Pointer(&ts[0]))
+	}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_UTIMENSAT,
+		uintptr(dirfd),
+		pathArg,
+		tsArg,
+		uintptr(flags),
+		0, 0,
+	)
+	return errno
 }
 
 // xattrNameMax mirrors include/uapi/linux/limits.h XATTR_NAME_MAX.
