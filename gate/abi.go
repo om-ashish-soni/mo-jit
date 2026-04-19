@@ -97,6 +97,8 @@ const (
 	SysFTruncate  uint64 = 46
 	SysFAccessAt  uint64 = 48
 	SysChDir      uint64 = 49
+	SysFChMod     uint64 = 52
+	SysFChModAt   uint64 = 53
 	SysOpenAt     uint64 = 56
 	SysClose      uint64 = 57
 	SysPipe2      uint64 = 59

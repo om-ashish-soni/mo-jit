@@ -1660,6 +1660,86 @@ func handleTruncate(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleFChMod services fchmod(fd, mode) (NR=52). Pure host-fd
+// passthrough — the copy-up decision was made at open time. A
+// writable upper fd accepts chmod; an rdonly lower fd doesn't even
+// reach us writable (ditto a fresh O_RDONLY anywhere).
+func handleFChMod(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	mode := uint32(regs.X[1])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if err := syscall.Fchmod(hostFd, mode); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// handleFChModAt services fchmodat(dirfd, path, mode, flags) (NR=53).
+// aarch64 layout: x0=dirfd, x1=path, x2=mode, x3=flags.
+//
+// Like truncate, fchmodat touches a guest path so it owns the layer
+// split. Lower-only files get copied up first — a permission change
+// only matters on the upper copy since that's what the guest sees
+// afterwards.
+//
+// AT_SYMLINK_NOFOLLOW is accepted as a flag but Linux itself rejects
+// chmod-on-symlink with ENOTSUP on every common filesystem; we pass
+// it through to syscall.Fchmodat and let the kernel surface the
+// errno.
+func handleFChModAt(d *Dispatcher, regs *Regs) Verdict {
+	dirfd := int64(regs.X[0])
+	pathPtr := regs.X[1]
+	mode := uint32(regs.X[2])
+	flags := int(regs.X[3])
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	path, err := d.Paths.ReadPath(pathPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	absGuest, ok := absolutiseAt(d, dirfd, path)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	hostPath, layer, err := d.FS.Resolve(absGuest)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if layer == LayerLower {
+		if _, err := os.Lstat(hostPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		upperPath, err := d.FS.CopyUp(absGuest)
+		if err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+		hostPath = upperPath
+	}
+	if err := syscall.Fchmodat(atFDCWD, hostPath, mode, flags); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing
