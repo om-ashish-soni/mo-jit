@@ -2942,6 +2942,85 @@ func encodeSockaddr(sa syscall.Sockaddr) ([]byte, error) {
 	}
 }
 
+// handleGetSockName services getsockname(sockfd, addr, addrlen)
+// (NR=204) and its sibling handleGetPeerName handles getpeername
+// (NR=205). Both read *addrlen from guest memory, ask the kernel for
+// the local (or remote) sockaddr of a host fd, encode it back to
+// guest memory, and update *addrlen to the full length.
+//
+// No policy: these are pure introspection on an fd the guest already
+// owns. Needed early because libc bind-with-port-0 patterns call
+// getsockname afterwards to learn the ephemeral port — without it,
+// things like Go's net.Listen("tcp4", "127.0.0.1:0") can't report
+// back where they're listening.
+func handleGetSockName(d *Dispatcher, regs *Regs) Verdict {
+	return getNameCommon(d, regs, syscall.Getsockname)
+}
+
+// handleGetPeerName services getpeername (NR=205); see getsockname for
+// shape notes.
+func handleGetPeerName(d *Dispatcher, regs *Regs) Verdict {
+	return getNameCommon(d, regs, syscall.Getpeername)
+}
+
+// getNameCommon is the shared body for getsockname / getpeername. The
+// only difference between them is which kernel routine we call; the
+// caller passes it as fn.
+func getNameCommon(d *Dispatcher, regs *Regs, fn func(int) (syscall.Sockaddr, error)) Verdict {
+	guestFd := int(regs.X[0])
+	addrPtr := regs.X[1]
+	addrLenPtr := regs.X[2]
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	sa, err := fn(hostFd)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	saBytes, err := encodeSockaddr(sa)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	avail := len(saBytes)
+	if addrLenPtr != 0 {
+		lb, lerr := d.MemR.ReadBytes(addrLenPtr, 4)
+		if lerr != nil {
+			regs.X[0] = EncodeErrno(lerr)
+			return VerdictHandled
+		}
+		glen := int(binary.LittleEndian.Uint32(lb))
+		if glen < 0 {
+			regs.X[0] = EncodeErrno(syscall.EINVAL)
+			return VerdictHandled
+		}
+		if glen < avail {
+			avail = glen
+		}
+	}
+	if addrPtr != 0 && avail > 0 {
+		if err := d.Mem.WriteBytes(addrPtr, saBytes[:avail]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	if addrLenPtr != 0 {
+		var lb [4]byte
+		binary.LittleEndian.PutUint32(lb[:], uint32(len(saBytes)))
+		if err := d.Mem.WriteBytes(addrLenPtr, lb[:]); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleSocket services socket(domain, type, protocol) (NR=198). Entry
 // point for the NetGate family — nothing else in the net path works
 // until this one allocates a guest fd backed by a real host socket.
