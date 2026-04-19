@@ -19,6 +19,16 @@ type Dispatcher struct {
 	FS  *FSGate
 	Net *NetGate
 
+	// Paths reads NUL-terminated C strings out of the guest's virtual
+	// address space. Handlers that take path arguments (openat,
+	// newfstatat, faccessat, ...) call Paths.ReadPath on regs.X[N] to
+	// materialise the guest-side path before handing it to FSGate.
+	//
+	// NewDispatcher installs NoopPathReader, which fails every call
+	// with ErrFault. The cgo bridge swaps in a real reader backed by
+	// gum's in-process memory access; see path_reader.go.
+	Paths PathReader
+
 	// handlers maps aarch64 syscall number -> Handler. An absent
 	// entry means "we don't intercept this syscall" and the svc hook
 	// passes it through to the kernel.
@@ -31,6 +41,7 @@ func NewDispatcher(p Policy) *Dispatcher {
 	d := &Dispatcher{
 		FS:       NewFSGate(p),
 		Net:      NewNetGate(p.Net),
+		Paths:    NoopPathReader{},
 		handlers: make(map[uint64]Handler),
 	}
 	d.registerDefaults()
