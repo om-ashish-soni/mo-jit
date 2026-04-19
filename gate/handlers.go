@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -2605,6 +2606,101 @@ func handleClose(d *Dispatcher, regs *Regs) Verdict {
 	}
 	regs.X[0] = 0
 	return VerdictHandled
+}
+
+// handleConnect services connect(sockfd, sockaddr, addrlen) (NR=203).
+// Gates every outbound network destination against NetPolicy before
+// forwarding to the kernel. This is the enforcement point for "don't
+// let the guest connect to 10.x even if the user hasn't explicitly
+// denied it" (builtin deny list in netgate.go).
+//
+// aarch64 layout: x0 = sockfd, x1 = sockaddr ptr, x2 = addrlen.
+//
+// Supported address families:
+//   - AF_INET  (16-byte sockaddr_in): family + port + IPv4 addr.
+//   - AF_INET6 (28-byte sockaddr_in6): family + port + flowinfo +
+//     IPv6 addr + scope_id.
+//   - AF_UNIX: ENOSYS for now. Unix paths need FSGate translation so
+//     the guest can connect to sockets living under its virtualised
+//     rootfs, not host /tmp. Tracked as a follow-up.
+//
+// Port bytes in the sockaddr are network-byte-order (big-endian);
+// IPv4/IPv6 address bytes are already in network order as raw octets,
+// so we feed them into netip.Addr directly.
+func handleConnect(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	addrPtr := regs.X[1]
+	addrLen := int(regs.X[2])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	if addrLen < 2 {
+		regs.X[0] = EncodeErrno(syscall.EINVAL)
+		return VerdictHandled
+	}
+	buf, err := d.MemR.ReadBytes(addrPtr, addrLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	family := binary.LittleEndian.Uint16(buf[0:2])
+
+	sa, ap, err := decodeSockaddr(family, buf)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+
+	// NetPolicy check runs AFTER decode so we can tell the guest why.
+	// Blocked destinations all become EACCES — indistinguishable from
+	// the kernel's own decision when, say, firewall rules drop the
+	// packet; a policy-aware guest has no need to distinguish.
+	if err := d.Net.CheckConnect(ap); err != nil {
+		regs.X[0] = EncodeErrno(syscall.EACCES)
+		return VerdictHandled
+	}
+	if err := syscall.Connect(hostFd, sa); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
+// decodeSockaddr unpacks a sockaddr blob read from guest memory into
+// (Go syscall.Sockaddr, netip.AddrPort). The AddrPort is what the
+// policy gate inspects; the Sockaddr is what syscall.Connect wants.
+// Returns EAFNOSUPPORT for families we don't emulate (AF_UNIX is
+// deferred) and EINVAL for truncated blobs.
+func decodeSockaddr(family uint16, buf []byte) (syscall.Sockaddr, netip.AddrPort, error) {
+	switch family {
+	case syscall.AF_INET:
+		if len(buf) < 16 {
+			return nil, netip.AddrPort{}, syscall.EINVAL
+		}
+		port := binary.BigEndian.Uint16(buf[2:4])
+		var addr [4]byte
+		copy(addr[:], buf[4:8])
+		sa := &syscall.SockaddrInet4{Port: int(port), Addr: addr}
+		return sa, netip.AddrPortFrom(netip.AddrFrom4(addr), port), nil
+	case syscall.AF_INET6:
+		if len(buf) < 28 {
+			return nil, netip.AddrPort{}, syscall.EINVAL
+		}
+		port := binary.BigEndian.Uint16(buf[2:4])
+		var addr [16]byte
+		copy(addr[:], buf[8:24])
+		scopeID := binary.LittleEndian.Uint32(buf[24:28])
+		sa := &syscall.SockaddrInet6{Port: int(port), ZoneId: scopeID, Addr: addr}
+		return sa, netip.AddrPortFrom(netip.AddrFrom16(addr), port), nil
+	case syscall.AF_UNIX:
+		return nil, netip.AddrPort{}, syscall.ENOSYS
+	default:
+		return nil, netip.AddrPort{}, syscall.EAFNOSUPPORT
+	}
 }
 
 // handleSocket services socket(domain, type, protocol) (NR=198). Entry
