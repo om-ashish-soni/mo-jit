@@ -1343,6 +1343,34 @@ func handlePipe2(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleLSeek services lseek(fd, offset, whence) (NR=62).
+//
+// aarch64 layout: x0 = fd, x1 = offset (i64 — aarch64 off_t is 64-bit,
+// no llseek split), x2 = whence.
+//
+// Pure host-fd passthrough. Layer bookkeeping happens at open time;
+// once a guest fd has been bound to a host fd, the kernel's own offset
+// is the source of truth. SEEK_DATA / SEEK_HOLE work automatically for
+// overlay paths because the host fd resolves to either upper or lower.
+func handleLSeek(d *Dispatcher, regs *Regs) Verdict {
+	guestFd := int(regs.X[0])
+	offset := int64(regs.X[1])
+	whence := int(regs.X[2])
+
+	hostFd, ok := d.FDs.Resolve(guestFd)
+	if !ok {
+		regs.X[0] = EncodeErrno(syscall.EBADF)
+		return VerdictHandled
+	}
+	off, err := syscall.Seek(hostFd, offset, whence)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = uint64(off)
+	return VerdictHandled
+}
+
 // handleClose services close(fd) (NR=57).
 //
 // Releases the guest fd from the table, then close(2)s the backing

@@ -98,6 +98,7 @@ const (
 	SysOpenAt     uint64 = 56
 	SysClose      uint64 = 57
 	SysPipe2      uint64 = 59
+	SysLSeek      uint64 = 62
 	SysRead       uint64 = 63
 	SysWrite      uint64 = 64
 	SysReadLinkAt uint64 = 78
