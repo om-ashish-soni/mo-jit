@@ -484,6 +484,96 @@ func handleMkdirAt(d *Dispatcher, regs *Regs) Verdict {
 	return VerdictHandled
 }
 
+// handleSymlinkAt services symlinkat(target, newdirfd, linkpath) (NR=36).
+//
+// aarch64 layout:
+//
+//	x0 = target (const char *)
+//	x1 = newdirfd
+//	x2 = linkpath (const char *)
+//
+// Target is copied into the link verbatim — the kernel never walks it
+// at creation time. Resolution happens lazily on each path syscall
+// that traverses the link, at which point FSGate.Resolve re-enters
+// for the link's target on the guest's behalf.
+//
+// Semantics:
+//   - No UpperDir: EROFS.
+//   - linkpath already present on either layer: EEXIST.
+//   - Parent chain missing on upper but present on lower: we MkdirAll
+//     upper parents (same pattern as mkdirat), so subsequent stats of
+//     the link resolve through upper.
+//   - Whiteout at linkpath: remove it, then create the symlink.
+//     Matches mkdirat's whiteout handling.
+func handleSymlinkAt(d *Dispatcher, regs *Regs) Verdict {
+	targetPtr := regs.X[0]
+	newdirfd := int64(regs.X[1])
+	linkPtr := regs.X[2]
+
+	if d.FS.policy.UpperDir == "" {
+		regs.X[0] = EncodeErrno(syscall.EROFS)
+		return VerdictHandled
+	}
+
+	target, err := d.Paths.ReadPath(targetPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	linkPath, err := d.Paths.ReadPath(linkPtr, MaxPathLen)
+	if err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	// Empty target would create a link to "" — the kernel rejects
+	// this with ENOENT.
+	if target == "" {
+		regs.X[0] = EncodeErrno(syscall.ENOENT)
+		return VerdictHandled
+	}
+
+	var absGuest string
+	switch {
+	case filepath.IsAbs(linkPath):
+		absGuest = filepath.Clean(linkPath)
+	case newdirfd == int64(atFDCWD):
+		absGuest = d.FS.AbsFromGuest(linkPath)
+	default:
+		regs.X[0] = EncodeErrno(syscall.ENOSYS)
+		return VerdictHandled
+	}
+
+	upperPath := filepath.Join(d.FS.policy.UpperDir, absGuest)
+
+	hostPath, _, rerr := d.FS.Resolve(absGuest)
+	switch {
+	case errors.Is(rerr, ErrWhiteout):
+		if err := os.Remove(upperPath); err != nil {
+			regs.X[0] = EncodeErrno(err)
+			return VerdictHandled
+		}
+	case rerr != nil:
+		regs.X[0] = EncodeErrno(rerr)
+		return VerdictHandled
+	default:
+		if _, err := os.Lstat(hostPath); err == nil {
+			regs.X[0] = EncodeErrno(syscall.EEXIST)
+			return VerdictHandled
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(upperPath), 0o755); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	if err := os.Symlink(target, upperPath); err != nil {
+		regs.X[0] = EncodeErrno(err)
+		return VerdictHandled
+	}
+	regs.X[0] = 0
+	return VerdictHandled
+}
+
 // handleNewFStatAt services newfstatat(dirfd, pathname, statbuf, flags)
 // (NR=79). Modern glibc/musl route both the `stat` and `lstat` libc
 // entry points through this syscall; libc's `fstat` also funnels here
